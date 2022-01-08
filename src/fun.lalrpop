@@ -1,0 +1,23 @@
+use std::str::FromStr;
+use crate::ast::{Expr};
+
+grammar;
+
+pub Expr: Box<Expr<'input>> = {
+	Expr1,
+	"\\" <x:Ident> "->" <e:Expr1> => Box::new(Expr::Abs(x, e)),
+};
+
+Expr1: Box<Expr<'input>> = {
+	Expr2,
+	Expr1 Expr2 => Box::new(Expr::App(<>)),
+}
+
+Expr2: Box<Expr<'input>> = {
+	Num => Box::new(Expr::Number(<>)),
+	Ident => Box::new(Expr::Var(<>)),
+    "(" <Expr> ")",
+};
+
+Num: i32 = r"-?[0-9]+" => i32::from_str(<>).unwrap();
+Ident = r"[a-z]+";

@@ -1,0 +1,278 @@
+use logos::Logos;
+use std::fmt;
+use std::ops::Range;
+
+#[derive(Logos, Clone, Copy, PartialEq, Debug)]
+pub enum Token<'input> {
+    #[token(r"\")]
+    BackSlash,
+    #[token("->")]
+    Arrow,
+    #[token("(")]
+    LParen,
+    #[token(")")]
+    RParen,
+
+    #[token("case")]
+    Case,
+    #[token("of")]
+    Of,
+
+    LayoutStart,
+    LayoutSep,
+    LayoutEnd,
+
+    #[regex("-?[0-9]+", |lex| lex.slice().parse())]
+    Number(i32),
+
+    #[regex("[a-zA-Z][a-zA-Z0-9]*")]
+    Ident(&'input str),
+
+    #[error]
+    #[regex(r"[ \n\f]+", logos::skip)]
+    Error,
+}
+
+impl<'input> fmt::Display for Token<'input> {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        use Token::*;
+        match self {
+            BackSlash => write!(fmt, "\\"),
+            Arrow => write!(fmt, "->"),
+            LParen => write!(fmt, "("),
+            RParen => write!(fmt, ")"),
+            Case => write!(fmt, "case"),
+            Of => write!(fmt, "of"),
+            LayoutStart => write!(fmt, "{{"),
+            LayoutSep => write!(fmt, ","),
+            LayoutEnd => write!(fmt, "}}"),
+            Number(n) => n.fmt(fmt),
+            Ident(s) => s.fmt(fmt),
+            Error => write!(fmt, "error"),
+        }
+    }
+}
+
+#[derive(PartialEq, Eq, Debug)]
+pub struct Error;
+
+impl<'input> fmt::Display for Error {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        write!(fmt, "error")
+    }
+}
+
+pub type Spanned<Tok, Loc, Error> = Result<(Loc, Tok, Loc), Error>;
+
+pub struct Lexer<'input> {
+    input: &'input str,
+    iter: logos::SpannedIter<'input, Token<'input>>,
+    /// The start byte index of the previous token.
+    cursor: usize,
+    /// The column index of the previous token.
+    column: usize,
+    line_start: usize,
+    next: Vec<(usize, Token<'input>, usize)>,
+
+    stack: Vec<State>,
+}
+
+impl<'input> Lexer<'input> {
+    pub fn new(input: &'input str) -> Self {
+        Self {
+            input,
+            iter: Token::lexer(input).spanned(),
+            cursor: 0,
+            column: 0,
+            line_start: 0,
+            stack: Vec::new(),
+            next: Vec::new(),
+        }
+    }
+
+    fn collapse(&mut self, mut f: impl FnMut(&State) -> bool) {
+        let pos = self.cursor;
+        while let Some(state) = self.stack.last() {
+            if !f(state) {
+                break;
+            }
+            match state {
+                // Empty layout
+                State::LayoutStart(_) => {
+                    self.next.push((pos, Token::LayoutEnd, pos));
+                    self.next.push((pos, Token::LayoutStart, pos));
+                }
+
+                State::Layout(_) => self.next.push((pos, Token::LayoutEnd, pos)),
+                _ => {}
+            }
+            self.stack.pop();
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Delimiter {
+    Paren,
+}
+
+#[derive(PartialEq, Eq, Debug)]
+enum State {
+    LayoutStart(usize),
+    Layout(usize),
+    Delimiter(Delimiter),
+}
+
+impl State {
+    fn is_indented(&self) -> bool {
+        match self {
+            State::LayoutStart(_) | State::Layout(_) => true,
+            State::Delimiter(_) => false,
+        }
+    }
+}
+
+impl<'input> Iterator for Lexer<'input> {
+    type Item = Spanned<Token<'input>, usize, Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(item) = self.next.pop() {
+            return Some(Ok(item));
+        }
+
+        let (token, Range { start, end }) = if let Some(item) = self.iter.next() {
+            item
+        } else {
+            match self.stack.pop() {
+                Some(State::Delimiter(_)) | None => return None,
+
+                Some(State::LayoutStart(_)) | Some(State::Layout(_)) => {
+                    let end = self.input.len();
+                    return Some(Ok((end, Token::LayoutEnd, end)));
+                }
+            }
+        };
+        if let Token::Error = token {
+            return Some(Err(Error));
+        }
+        self.next.push((start, token, end));
+
+        let mut newline = false;
+        self.column =
+            self.input[self.cursor..start]
+                .chars()
+                .fold(self.column, |acc, ch| match ch {
+                    '\n' => {
+                        newline = true;
+                        0
+                    }
+                    _ => acc + 1,
+                });
+        self.cursor = start;
+        if newline {
+            self.line_start = self.column;
+        }
+
+        let column = self.column;
+        let is_offside = |state: &State| match state {
+            State::Layout(layout_col) if newline && column < *layout_col => true,
+            _ => false,
+        };
+        /*
+        let until_delim = |delim| {
+            let mut saw_delim = false;
+            move |state: &State| {
+                let result = !saw_delim;
+                saw_delim = state == &State::Delimiter(delim);
+                result
+            }
+        };
+        */
+
+        let mut should_insert_default = false;
+        match token {
+            Token::LParen => {
+                self.stack.push(State::Delimiter(Delimiter::Paren));
+                self.collapse(is_offside);
+                should_insert_default = true;
+            }
+            Token::RParen => {
+                // self.collapse(until_delim(Delimiter::Paren));
+                self.collapse(State::is_indented);
+                if self.stack.last() == Some(&State::Delimiter(Delimiter::Paren)) {
+                    self.stack.pop();
+                }
+            }
+
+            Token::Of => {
+                self.collapse(State::is_indented);
+                self.stack.push(State::LayoutStart(self.line_start));
+            }
+
+            _ => {
+                should_insert_default = true;
+            }
+        }
+
+        if should_insert_default {
+            match self.stack.last() {
+                Some(State::LayoutStart(min_col)) if self.column > *min_col => {
+                    self.stack.pop();
+                    self.stack.push(State::Layout(self.column));
+                    self.next.push((start, Token::LayoutStart, start));
+                }
+
+                Some(State::Layout(layout_col)) if newline && self.column == *layout_col => {
+                    self.next.push((start, Token::LayoutSep, start));
+                }
+
+                Some(State::Layout(_)) => {}
+                Some(State::Delimiter(_)) => {}
+                _ => {}
+            }
+        }
+
+        Some(Ok(self.next.pop().expect("The next token got popped?")))
+    }
+}
+
+mod tests {
+    use super::*;
+    use Token::*;
+
+    #[test]
+    fn test_lex_layout_newline() {
+        assert_eq!(
+            Lexer::new("case 0 of\n x -> x").collect::<Result<_, _>>(),
+            Ok(vec![
+                (0, Case, 4),
+                (5, Number(0), 6),
+                (7, Of, 9),
+                (11, LayoutStart, 11),
+                (11, Ident("x"), 12),
+                (13, Arrow, 15),
+                (16, Ident("x"), 17),
+                (17, LayoutEnd, 17)
+            ])
+        );
+    }
+
+    #[test]
+    fn test_lex_layout_paren_parse_rule() {
+        assert_eq!(
+            Lexer::new("(case 0 of) x -> x").collect::<Result<_, _>>(),
+            Ok(vec![
+                (0, LParen, 1),
+                (1, Case, 5),
+                (6, Number(0), 7),
+                (8, Of, 10),
+                (10, LayoutStart, 10),
+                (10, LayoutEnd, 10),
+                (10, RParen, 11),
+                (12, Ident("x"), 13),
+                (14, Arrow, 16),
+                (17, Ident("x"), 18),
+            ])
+        );
+    }
+}

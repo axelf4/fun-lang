@@ -4,9 +4,9 @@ use std::error;
 use std::fmt;
 
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub enum Value<'a> {
+pub enum Value<'input> {
     Number(i32),
-    Lambda(Env<'a>, &'a str, Expr<'a>),
+    Lambda(Env<'input>, &'input str, Expr<'input>),
 }
 
 #[derive(Debug)]
@@ -27,25 +27,25 @@ impl fmt::Display for Error {
 impl error::Error for Error {}
 
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub struct Env<'a>(HashMap<&'a str, Value<'a>>);
+pub struct Env<'input>(HashMap<&'input str, Value<'input>>);
 
-impl<'a> Env<'a> {
+impl<'input> Env<'input> {
     fn new() -> Self {
         Env(HashMap::new())
     }
 
-    fn lookup(&self, id: &str) -> Option<Value<'a>> {
+    fn lookup(&self, id: &str) -> Option<Value<'input>> {
         self.0.get(id).cloned()
     }
 
-    fn insert(&self, id: &'a str, value: Value<'a>) -> Self {
+    fn insert(&self, id: &'input str, value: Value<'input>) -> Self {
         let mut map = self.0.clone();
         map.insert(id, value);
         Env(map)
     }
 }
 
-pub fn eval<'a, 'env>(env: &'env Env<'a>, e: Expr<'a>) -> Result<Value<'a>, Error> {
+pub fn eval<'input, 'env>(env: &'env Env<'input>, e: Expr<'input>) -> Result<Value<'input>, Error> {
     Ok(match e {
         Expr::Number(n) => Value::Number(n),
         Expr::Var(id) => env.lookup(&id).ok_or(Error::UnknownVar)?,

@@ -1,11 +1,42 @@
-use std::str::FromStr;
+use crate::lexer::{self, Token};
 use crate::ast::{Expr};
 
-grammar;
+grammar<'input>;
+
+extern {
+	type Location = usize;
+	type Error = lexer::Error;
+
+	enum Token<'input> {
+		"\\" => Token::BackSlash,
+		"->" => Token::Arrow,
+		"(" => Token::LParen,
+		")" => Token::RParen,
+		"case" => Token::Case,
+		"of" => Token::Of,
+		"{" => Token::LayoutStart,
+		"," => Token::LayoutSep,
+		"}" => Token::LayoutEnd,
+		Num => Token::Number(<i32>),
+		Ident => Token::Ident(<&'input str>),
+	}
+}
+
+Comma<T>: Vec<T> = {
+    <mut v:(<T> ",")*> <e:T?> => match e {
+        None => v,
+        Some(e) => {
+            v.push(e);
+            v
+        }
+    }
+};
 
 pub Expr: Box<Expr<'input>> = {
 	Expr1,
 	"\\" <x:Ident> "->" <e:Expr1> => Box::new(Expr::Abs(x, e)),
+
+	"case" <_x:Expr> "of" "{" Comma<Binder> "}" => Box::new(Expr::Number(69)),
 };
 
 Expr1: Box<Expr<'input>> = {
@@ -16,8 +47,9 @@ Expr1: Box<Expr<'input>> = {
 Expr2: Box<Expr<'input>> = {
 	Num => Box::new(Expr::Number(<>)),
 	Ident => Box::new(Expr::Var(<>)),
-    "(" <Expr> ")",
+	"(" <Expr> ")",
 };
 
-Num: i32 = r"-?[0-9]+" => i32::from_str(<>).unwrap();
-Ident = r"[a-z]+";
+Binder: () = {
+	Expr "->" Expr => {},
+};

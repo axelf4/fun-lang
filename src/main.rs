@@ -4,6 +4,7 @@ lalrpop_mod!(pub fun);
 
 mod ast;
 mod interpreter;
+mod lexer;
 mod typecheck;
 
 mod tests {
@@ -13,7 +14,7 @@ mod tests {
 
     #[test]
     fn test_parse_omega() -> Result<(), Box<dyn error::Error>> {
-        let expr = fun::ExprParser::new().parse("\\x -> x x")?;
+        let expr = fun::ExprParser::new().parse(lexer::Lexer::new("\\x -> x x"))?;
         assert_eq!(
             expr,
             Box::new(Expr::Abs(
@@ -24,6 +25,14 @@ mod tests {
                 ))
             ))
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_layout() -> Result<(), Box<dyn error::Error>> {
+        let expr = fun::ExprParser::new().parse(lexer::Lexer::new("case 0 of\n  x -> x"))?;
+        assert_eq!(expr, Box::new(Expr::Number(69)));
 
         Ok(())
     }

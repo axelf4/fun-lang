@@ -67,9 +67,9 @@ impl State {
     }
 }
 
-struct Ctx<'a>(HashMap<&'a str, Type>);
+struct Ctx<'input>(HashMap<&'input str, Type>);
 
-impl<'a> Ctx<'a> {
+impl<'input> Ctx<'input> {
     fn new() -> Self {
         Self(HashMap::new())
     }
@@ -78,14 +78,14 @@ impl<'a> Ctx<'a> {
         self.0.get(id).cloned()
     }
 
-    fn insert(&self, id: &'a str, ty: Type) -> Ctx<'a> {
+    fn insert(&self, id: &'input str, ty: Type) -> Ctx<'input> {
         let mut map = self.0.clone();
         map.insert(id, ty);
         Ctx(map)
     }
 }
 
-fn infer<'a, 'ctx>(state: &mut State, ctx: &'ctx Ctx, e: Expr<'a>) -> Result<Type, Error> {
+fn infer<'input, 'ctx>(state: &mut State, ctx: &'ctx Ctx, e: Expr<'input>) -> Result<Type, Error> {
     Ok(match e {
         Expr::Number(_) => Type::Number,
         Expr::Var(id) => ctx.lookup(id).ok_or(Error::UnknownVar)?,
@@ -166,12 +166,11 @@ impl fmt::Display for Substitution {
         write!(fmt, "{{")?;
         let mut first = true;
         self.0.iter().try_for_each::<_, fmt::Result>(|(v, t)| {
-            write!(fmt, "{}/{}", t, v)?;
             if !first {
                 write!(fmt, ", ")?;
             }
             first = false;
-            Ok(())
+            write!(fmt, "{}/{}", t, v)
         })?;
         write!(fmt, "}}")
     }
@@ -193,13 +192,7 @@ fn unify(constraints: Vec<Constraint>) -> Result<Substitution, Error> {
                 constraints.push_back(Constraint(t1, t2));
             }
 
-            (Type::Var(v), t) => {
-                sub = Substitution::compose(
-                    sub.clone(),
-                    Substitution::single(v, t).ok_or(Error::InfiniteType)?,
-                );
-            }
-            (t, Type::Var(v)) => {
+            (Type::Var(v), t) | (t, Type::Var(v)) => {
                 sub = Substitution::compose(
                     sub.clone(),
                     Substitution::single(v, t).ok_or(Error::InfiniteType)?,
@@ -213,7 +206,7 @@ fn unify(constraints: Vec<Constraint>) -> Result<Substitution, Error> {
     Ok(sub)
 }
 
-pub fn typecheck<'a>(e: Expr<'a>) -> Result<Type, Error> {
+pub fn typecheck<'input>(e: Expr<'input>) -> Result<Type, Error> {
     let mut state = State::new();
     let ty = infer(&mut state, &Ctx::new(), e)?;
     let sub = unify(state.constraints)?;

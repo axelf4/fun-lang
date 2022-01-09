@@ -1,7 +1,7 @@
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub enum Expr<'a> {
+pub enum Expr<'input> {
     Number(i32),
-    Var(&'a str),
-    App(Box<Expr<'a>>, Box<Expr<'a>>),
-    Abs(&'a str, Box<Expr<'a>>),
+    Var(&'input str),
+    App(Box<Expr<'input>>, Box<Expr<'input>>),
+    Abs(&'input str, Box<Expr<'input>>),
 }

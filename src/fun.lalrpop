@@ -36,7 +36,7 @@ pub Expr: Box<Expr<'input>> = {
 	Expr1,
 	"\\" <x:Ident> "->" <e:Expr1> => Box::new(Expr::Abs(x, e)),
 
-	"case" <_x:Expr> "of" "{" Comma<Binder> "}" => Box::new(Expr::Number(69)),
+	"case" <_x:Expr> "of" "{" Comma<Arm> "}" => Box::new(Expr::Number(69)),
 };
 
 Expr1: Box<Expr<'input>> = {
@@ -50,6 +50,6 @@ Expr2: Box<Expr<'input>> = {
 	"(" <Expr> ")",
 };
 
-Binder: () = {
+Arm: () = {
 	Expr "->" Expr => {},
 };

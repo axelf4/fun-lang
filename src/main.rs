@@ -30,8 +30,8 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_layout() -> Result<(), Box<dyn error::Error>> {
-        let expr = fun::ExprParser::new().parse(lexer::Lexer::new("case 0 of\n  x -> x"))?;
+    fn test_parse_empty_layout() -> Result<(), Box<dyn error::Error>> {
+        let expr = fun::ExprParser::new().parse(lexer::Lexer::new("case 0 of"))?;
         assert_eq!(expr, Box::new(Expr::Number(69)));
 
         Ok(())

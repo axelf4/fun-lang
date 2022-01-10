@@ -30,6 +30,7 @@ pub enum Token<'input> {
 
     #[error]
     #[regex(r"[ \n\f]+", logos::skip)]
+    #[regex(r"--.*", logos::skip)]
     Error,
 }
 
@@ -63,6 +64,31 @@ impl<'input> fmt::Display for Error {
 }
 
 pub type Spanned<Tok, Loc, Error> = Result<(Loc, Tok, Loc), Error>;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Delimiter {
+    Paren,
+}
+
+#[derive(PartialEq, Eq, Debug)]
+enum State {
+    LayoutStart(usize),
+    Layout(usize),
+    Delimiter(Delimiter),
+}
+
+impl State {
+    /// Returns whether this stack entry was implicitly added.
+    ///
+    /// Implicit entries should be collapsed when explicit layout
+    /// tokens are encountered in lookahead.
+    fn is_implicit(&self) -> bool {
+        match self {
+            State::LayoutStart(_) | State::Layout(_) => true,
+            State::Delimiter(_) => false,
+        }
+    }
+}
 
 pub struct Lexer<'input> {
     input: &'input str,
@@ -99,35 +125,14 @@ impl<'input> Lexer<'input> {
             match state {
                 // Empty layout
                 State::LayoutStart(_) => {
-                    self.next.push((pos, Token::LayoutEnd, pos));
-                    self.next.push((pos, Token::LayoutStart, pos));
+                    self.next
+                        .extend([(pos, Token::LayoutEnd, pos), (pos, Token::LayoutStart, pos)]);
                 }
 
                 State::Layout(_) => self.next.push((pos, Token::LayoutEnd, pos)),
-                _ => {}
+                State::Delimiter(_) => {}
             }
             self.stack.pop();
-        }
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Delimiter {
-    Paren,
-}
-
-#[derive(PartialEq, Eq, Debug)]
-enum State {
-    LayoutStart(usize),
-    Layout(usize),
-    Delimiter(Delimiter),
-}
-
-impl State {
-    fn is_indented(&self) -> bool {
-        match self {
-            State::LayoutStart(_) | State::Layout(_) => true,
-            State::Delimiter(_) => false,
         }
     }
 }
@@ -143,14 +148,10 @@ impl<'input> Iterator for Lexer<'input> {
         let (token, Range { start, end }) = if let Some(item) = self.iter.next() {
             item
         } else {
-            match self.stack.pop() {
-                Some(State::Delimiter(_)) | None => return None,
-
-                Some(State::LayoutStart(_)) | Some(State::Layout(_)) => {
-                    let end = self.input.len();
-                    return Some(Ok((end, Token::LayoutEnd, end)));
-                }
-            }
+            // Pop all remaining stack entries
+            self.cursor = self.input.len();
+            self.collapse(|_| true);
+            return self.next.pop().map(Ok);
         };
         if let Token::Error = token {
             return Some(Err(Error));
@@ -198,14 +199,14 @@ impl<'input> Iterator for Lexer<'input> {
             }
             Token::RParen => {
                 // self.collapse(until_delim(Delimiter::Paren));
-                self.collapse(State::is_indented);
+                self.collapse(State::is_implicit);
                 if self.stack.last() == Some(&State::Delimiter(Delimiter::Paren)) {
                     self.stack.pop();
                 }
             }
 
             Token::Of => {
-                self.collapse(State::is_indented);
+                self.collapse(State::is_implicit);
                 self.stack.push(State::LayoutStart(self.line_start));
             }
 
@@ -241,19 +242,24 @@ mod tests {
     use Token::*;
 
     #[test]
-    fn test_lex_layout_newline() {
+    fn test_lex_case_layout_good() {
+        let expected = Ok(vec![
+            (0, Case, 4),
+            (5, Number(0), 6),
+            (7, Of, 9),
+            (11, LayoutStart, 11),
+            (11, Ident("x"), 12),
+            (13, Arrow, 15),
+            (16, Ident("x"), 17),
+            (17, LayoutEnd, 17),
+        ]);
         assert_eq!(
             Lexer::new("case 0 of\n x -> x").collect::<Result<_, _>>(),
-            Ok(vec![
-                (0, Case, 4),
-                (5, Number(0), 6),
-                (7, Of, 9),
-                (11, LayoutStart, 11),
-                (11, Ident("x"), 12),
-                (13, Arrow, 15),
-                (16, Ident("x"), 17),
-                (17, LayoutEnd, 17)
-            ])
+            expected
+        );
+        assert_eq!(
+            Lexer::new("case 0 of  x -> x").collect::<Result<_, _>>(),
+            expected
         );
     }
 

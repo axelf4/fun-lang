@@ -22,10 +22,10 @@ pub enum Token<'input> {
     LayoutSep,
     LayoutEnd,
 
-    #[regex("-?[0-9]+", |lex| lex.slice().parse())]
+    #[regex("-?[0-9]+", |lex| lex.slice().parse(), priority = 100)]
     Number(i32),
 
-    #[regex("[a-zA-Z][a-zA-Z0-9]*")]
+    #[regex(r#"[[:^space:]--[\\.()@"]]+"#)]
     Ident(&'input str),
 
     #[error]
@@ -240,6 +240,14 @@ impl<'input> Iterator for Lexer<'input> {
 mod tests {
     use super::*;
     use Token::*;
+
+    #[test]
+    fn test_lex_number() {
+        assert_eq!(
+            Lexer::new("-42").collect::<Result<_, _>>(),
+            Ok(vec![(0, Number(-42), 3)])
+        );
+    }
 
     #[test]
     fn test_lex_case_layout_good() {

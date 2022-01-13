@@ -5,12 +5,14 @@ use lalrpop_util::lalrpop_mod;
 use std::collections::HashSet;
 use std::iter;
 
-use nom::branch::alt;
-use nom::combinator::{eof, verify};
-use nom::multi::many1;
-use nom::sequence::terminated;
 use nom::IResult;
 use nom::Parser as _;
+use nom::{
+    branch::alt,
+    combinator::{eof, verify},
+    multi::many1,
+    sequence::terminated,
+};
 
 lalrpop_mod!(pub fun);
 
@@ -128,47 +130,25 @@ fn single_expr<'input: 'a, 'a>(
     }
 }
 
-#[derive(Clone)]
-struct AltIter<I>(I);
-
-impl<I> AltIter<I> {
-    fn alt_parse<Input, Output, Error>(self, input: Input) -> IResult<Input, Output, Error>
-    where
-        Input: Clone,
-        I: Iterator,
-        I::Item: nom::Parser<Input, Output, Error>,
-        Error: nom::error::ParseError<Input>,
-    {
+fn alt_iter<I, Input, Output, Error>(iter: I) -> impl FnOnce(Input) -> IResult<Input, Output, Error>
+where
+    Input: Clone,
+    I: Iterator,
+    I::Item: nom::Parser<Input, Output, Error>,
+    Error: nom::error::ParseError<Input>,
+{
+    |i| {
         let mut e: Option<Error> = None;
-        for mut p in self.0 {
-            match p.parse(input.clone()) {
-                Err(nom::Err::Error(e2)) => match e {
-                    Some(e1) => {
-                        e = Some(e1.or(e2));
-                    }
-                    None => {
-                        e = Some(e2);
-                    }
-                },
+        for mut p in iter {
+            match p.parse(i.clone()) {
+                Err(nom::Err::Error(e2)) => e = Some(if let Some(e1) = e { e1.or(e2) } else { e2 }),
                 res => return res,
             }
         }
         Err(nom::Err::Error(e.unwrap_or(Error::from_error_kind(
-            input,
-            nom::error::ErrorKind::Fail,
+            i,
+            nom::error::ErrorKind::Alt,
         ))))
-    }
-}
-
-impl<I, Input, O, E> nom::branch::Alt<Input, O, E> for AltIter<I>
-where
-    Input: Clone,
-    E: nom::error::ParseError<Input>,
-    I: Iterator + Clone,
-    I::Item: nom::Parser<Input, O, E>,
-{
-    fn choice(&mut self, input: Input) -> IResult<Input, O, E> {
-        self.clone().alt_parse(input)
     }
 }
 
@@ -184,12 +164,11 @@ fn precs<'input: 'a, 'a>(
 ) -> impl Fn(Input<'input, 'a>) -> IResult<Input<'input, 'a>, Term<'input>> {
     |i| {
         let op_closed = |i| {
-            AltIter(
+            alt_iter(
                 prec_graph
                     .nodes()
-                    .map(|p| inner_at_fix(p, prec_graph, Closed)),
-            )
-            .alt_parse(i)
+                    .map(|p| inner_at_fix(prec_graph, p, Closed)),
+            )(i)
         };
         let mut atom = many1(alt((prec_graph.non_op(), op_closed))).map(|mut xs| {
             let e = xs.pop().expect("many1 did not parse 1 element?");
@@ -200,14 +179,14 @@ fn precs<'input: 'a, 'a>(
         if ps.is_empty() {
             atom.parse(i)
         } else {
-            alt(AltIter(ps.into_iter().map(|p| prec(prec_graph, p))))(i)
+            alt_iter(ps.into_iter().map(|p| prec(prec_graph, p)))(i)
         }
     }
 }
 
 fn inner_at_fix<'input: 'a, 'a>(
-    p: &'a Precedence<'input>,
     prec_graph: &'a PrecedenceGraph<'input>,
+    p: &'a Precedence<'input>,
     fix: Fixity,
 ) -> impl Fn(Input<'input, 'a>) -> IResult<Input<'input, 'a>, Term<'input>> {
     // Match a single specific identifier token
@@ -216,7 +195,7 @@ fn inner_at_fix<'input: 'a, 'a>(
     move |i| {
         let ops = p.operators.iter().filter(move |Operator(f, _)| f == &fix);
 
-        AltIter(ops.map(|op @ Operator(_, s)| {
+        alt_iter(ops.map(|op @ Operator(_, s)| {
             move |i| {
                 let mut res = Term::Var(s);
                 let mut name_parts = op.name_parts();
@@ -232,8 +211,7 @@ fn inner_at_fix<'input: 'a, 'a>(
 
                 Ok((i, res))
             }
-        }))
-        .alt_parse(i)
+        }))(i)
     }
 }
 
@@ -255,14 +233,14 @@ fn prec<'input: 'a, 'a>(
         let x = alt((
             |i| {
                 let (i, el) = p_suc(i)?;
-                let (i, f) = inner_at_fix(p, prec_graph, Infix(Associativity::Non))(i)?;
+                let (i, f) = inner_at_fix(prec_graph, p, Infix(Associativity::Non))(i)?;
                 let (i, er) = p_suc(i)?;
                 Ok((i, Term::App(Box::new(prepend_arg(f, el)), Box::new(er))))
             },
             |i| {
-                let pre_right = alt((inner_at_fix(p, prec_graph, Prefix), |i| {
+                let pre_right = alt((inner_at_fix(prec_graph, p, Prefix), |i| {
                     let (i, e) = p_suc(i)?;
-                    let (i, f) = inner_at_fix(p, prec_graph, Infix(Associativity::Right))(i)?;
+                    let (i, f) = inner_at_fix(prec_graph, p, Infix(Associativity::Right))(i)?;
                     Ok((i, prepend_arg(f, e)))
                 }));
 
@@ -277,9 +255,9 @@ fn prec<'input: 'a, 'a>(
             },
             |i| {
                 let post_left = alt((
-                    inner_at_fix(p, prec_graph, Postfix).map(|f| (f, None)),
+                    inner_at_fix(prec_graph, p, Postfix).map(|f| (f, None)),
                     |i| {
-                        let (i, f) = inner_at_fix(p, prec_graph, Infix(Associativity::Left))(i)?;
+                        let (i, f) = inner_at_fix(prec_graph, p, Infix(Associativity::Left))(i)?;
                         let (i, er) = p_suc(i)?;
                         Ok((i, (f, Some(er))))
                     },

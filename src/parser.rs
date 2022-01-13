@@ -9,9 +9,8 @@ use nom::IResult;
 use nom::Parser as _;
 use nom::{
     branch::alt,
-    combinator::{eof, verify},
+    combinator::{all_consuming, verify},
     multi::many1,
-    sequence::terminated,
 };
 
 lalrpop_mod!(pub fun);
@@ -39,7 +38,7 @@ struct Operator<'a>(Fixity, &'a str);
 impl<'a> Operator<'a> {
     fn from_str(assoc: Associativity, s: &'a str) -> Option<Operator<'a>> {
         use Associativity::*;
-        if s.contains("__") {
+        if s == "_" || s.contains("__") {
             return None;
         }
         Some(match (s.starts_with('_'), assoc, s.ends_with('_')) {
@@ -98,7 +97,7 @@ impl<'input> PrecedenceGraph<'input> {
 
     fn non_op<'a>(
         &'a self,
-    ) -> impl FnMut(Input<'input, 'a>) -> IResult<Input<'input, 'a>, Term<'input>> {
+    ) -> impl FnMut(Input<'input, 'a>) -> IResult<Input<'input, 'a>, &'a Term<'input>> {
         verify(single_expr(), |e| {
             if let Term::Var(s) = e {
                 !self.op_parts.contains(s)
@@ -120,9 +119,9 @@ impl<'input, 'a> nom::InputLength for Input<'input, 'a> {
 
 /// Returns a parser for a single expression token.
 fn single_expr<'input: 'a, 'a>(
-) -> impl Fn(Input<'input, 'a>) -> IResult<Input<'input, 'a>, Term<'input>> {
+) -> impl Fn(Input<'input, 'a>) -> IResult<Input<'input, 'a>, &'a Term<'input>> {
     move |i| match i.0.split_first() {
-        Some((e, rest)) => Ok((Input(rest), e.clone())),
+        Some((ref e, rest)) => Ok((Input(rest), e)),
         _ => Err(nom::Err::Error(nom::error::Error {
             input: i,
             code: nom::error::ErrorKind::Tag,
@@ -170,12 +169,13 @@ fn precs<'input: 'a, 'a>(
                     .map(|p| inner_at_fix(prec_graph, p, Closed)),
             )(i)
         };
-        let mut atom = many1(alt((prec_graph.non_op(), op_closed))).map(|mut xs| {
-            let e = xs.pop().expect("many1 did not parse 1 element?");
-            xs.into_iter()
-                .rev()
-                .fold(e, |acc, f| Term::App(Box::new(f), Box::new(acc)))
-        });
+        let mut atom =
+            many1(alt((prec_graph.non_op().map(Clone::clone), op_closed))).map(|mut xs| {
+                let e = xs.pop().expect("many1 did not parse 1 element?");
+                xs.into_iter()
+                    .rev()
+                    .fold(e, |acc, f| Term::App(Box::new(f), Box::new(acc)))
+            });
         if ps.is_empty() {
             atom.parse(i)
         } else {
@@ -190,7 +190,7 @@ fn inner_at_fix<'input: 'a, 'a>(
     fix: Fixity,
 ) -> impl Fn(Input<'input, 'a>) -> IResult<Input<'input, 'a>, Term<'input>> {
     // Match a single specific identifier token
-    let ident = |id| verify(single_expr(), move |e| e == &Term::Var(id));
+    let ident = |id| verify(single_expr(), move |&e: &&Term<'input>| e == &Term::Var(id));
 
     move |i| {
         let ops = p.operators.iter().filter(move |Operator(f, _)| f == &fix);
@@ -306,7 +306,7 @@ fn prec_pass<'input, 'a>(g: &'a PrecedenceGraph<'input>, e: Term<'input>) -> Ter
             .collect::<Vec<_>>();
             xs.reverse();
 
-            let result = terminated(expr(g), eof)(Input(&xs))
+            let result = all_consuming(expr(g))(Input(&xs))
                 .expect("Failed to parse operator precedence")
                 .1;
             result

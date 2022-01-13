@@ -1,5 +1,5 @@
 /// Mixfix expression parser.
-use crate::ast::Expr;
+use crate::ast::Term;
 use crate::lexer::{self, Spanned, Token};
 use lalrpop_util::lalrpop_mod;
 use std::collections::HashSet;
@@ -96,9 +96,9 @@ impl<'input> PrecedenceGraph<'input> {
 
     fn non_op<'a>(
         &'a self,
-    ) -> impl FnMut(Input<'input, 'a>) -> IResult<Input<'input, 'a>, Expr<'input>> {
+    ) -> impl FnMut(Input<'input, 'a>) -> IResult<Input<'input, 'a>, Term<'input>> {
         verify(single_expr(), |e| {
-            if let Expr::Var(s) = e {
+            if let Term::Var(s) = e {
                 !self.op_parts.contains(s)
             } else {
                 true
@@ -108,7 +108,7 @@ impl<'input> PrecedenceGraph<'input> {
 }
 
 #[derive(Clone, Debug)]
-struct Input<'input, 'a>(&'a [Expr<'input>]);
+struct Input<'input, 'a>(&'a [Term<'input>]);
 
 impl<'input, 'a> nom::InputLength for Input<'input, 'a> {
     fn input_len(&self) -> usize {
@@ -118,7 +118,7 @@ impl<'input, 'a> nom::InputLength for Input<'input, 'a> {
 
 /// Returns a parser for a single expression token.
 fn single_expr<'input: 'a, 'a>(
-) -> impl Fn(Input<'input, 'a>) -> IResult<Input<'input, 'a>, Expr<'input>> {
+) -> impl Fn(Input<'input, 'a>) -> IResult<Input<'input, 'a>, Term<'input>> {
     move |i| match i.0.split_first() {
         Some((e, rest)) => Ok((Input(rest), e.clone())),
         _ => Err(nom::Err::Error(nom::error::Error {
@@ -174,14 +174,14 @@ where
 
 fn expr<'input: 'a, 'a>(
     prec_graph: &'a PrecedenceGraph<'input>,
-) -> impl Fn(Input<'input, 'a>) -> IResult<Input<'input, 'a>, Expr<'input>> {
+) -> impl Fn(Input<'input, 'a>) -> IResult<Input<'input, 'a>, Term<'input>> {
     precs(prec_graph, &prec_graph.roots)
 }
 
 fn precs<'input: 'a, 'a>(
     prec_graph: &'a PrecedenceGraph<'input>,
     ps: &'a [Precedence<'input>],
-) -> impl Fn(Input<'input, 'a>) -> IResult<Input<'input, 'a>, Expr<'input>> {
+) -> impl Fn(Input<'input, 'a>) -> IResult<Input<'input, 'a>, Term<'input>> {
     |i| {
         let op_closed = |i| {
             AltIter(
@@ -195,7 +195,7 @@ fn precs<'input: 'a, 'a>(
             let e = xs.pop().expect("many1 did not parse 1 element?");
             xs.into_iter()
                 .rev()
-                .fold(e, |acc, f| Expr::App(Box::new(f), Box::new(acc)))
+                .fold(e, |acc, f| Term::App(Box::new(f), Box::new(acc)))
         });
         if ps.is_empty() {
             atom.parse(i)
@@ -209,16 +209,16 @@ fn inner_at_fix<'input: 'a, 'a>(
     p: &'a Precedence<'input>,
     prec_graph: &'a PrecedenceGraph<'input>,
     fix: Fixity,
-) -> impl Fn(Input<'input, 'a>) -> IResult<Input<'input, 'a>, Expr<'input>> {
+) -> impl Fn(Input<'input, 'a>) -> IResult<Input<'input, 'a>, Term<'input>> {
     // Match a single specific identifier token
-    let ident = |id| verify(single_expr(), move |e| e == &Expr::Var(id));
+    let ident = |id| verify(single_expr(), move |e| e == &Term::Var(id));
 
     move |i| {
         let ops = p.operators.iter().filter(move |Operator(f, _)| f == &fix);
 
         AltIter(ops.map(|op @ Operator(_, s)| {
             move |i| {
-                let mut res = Expr::Var(s);
+                let mut res = Term::Var(s);
                 let mut name_parts = op.name_parts();
 
                 let (mut i, _) = ident(name_parts.next().unwrap())(i)?;
@@ -226,7 +226,7 @@ fn inner_at_fix<'input: 'a, 'a>(
                 while let Some(s) = name_parts.next() {
                     let (i2, e) = expr(prec_graph)(i)?;
                     let (i2, _) = ident(s)(i2)?;
-                    res = Expr::App(Box::new(res), Box::new(e));
+                    res = Term::App(Box::new(res), Box::new(e));
                     i = i2;
                 }
 
@@ -241,14 +241,14 @@ fn inner_at_fix<'input: 'a, 'a>(
 fn prec<'input: 'a, 'a>(
     prec_graph: &'a PrecedenceGraph<'input>,
     p: &'a Precedence<'input>,
-) -> impl Fn(Input<'input, 'a>) -> IResult<Input<'input, 'a>, Expr<'input>> + 'a {
+) -> impl Fn(Input<'input, 'a>) -> IResult<Input<'input, 'a>, Term<'input>> + 'a {
     move |i| {
         let p_suc = precs(prec_graph, &p.sucs); // TODO Memoize
 
-        fn prepend_arg<'input>(f: Expr<'input>, e: Expr<'input>) -> Expr<'input> {
+        fn prepend_arg<'input>(f: Term<'input>, e: Term<'input>) -> Term<'input> {
             match f {
-                Expr::App(f, e2) => Expr::App(Box::new(Expr::App(f, Box::new(e))), e2),
-                _ => Expr::App(Box::new(f), Box::new(e)),
+                Term::App(f, e2) => Term::App(Box::new(Term::App(f, Box::new(e))), e2),
+                _ => Term::App(Box::new(f), Box::new(e)),
             }
         }
 
@@ -257,7 +257,7 @@ fn prec<'input: 'a, 'a>(
                 let (i, el) = p_suc(i)?;
                 let (i, f) = inner_at_fix(p, prec_graph, Infix(Associativity::Non))(i)?;
                 let (i, er) = p_suc(i)?;
-                Ok((i, Expr::App(Box::new(prepend_arg(f, el)), Box::new(er))))
+                Ok((i, Term::App(Box::new(prepend_arg(f, el)), Box::new(er))))
             },
             |i| {
                 let pre_right = alt((inner_at_fix(p, prec_graph, Prefix), |i| {
@@ -272,7 +272,7 @@ fn prec<'input: 'a, 'a>(
                     i,
                     fs.into_iter()
                         .rev()
-                        .fold(e, |acc, f| Expr::App(Box::new(f), Box::new(acc))),
+                        .fold(e, |acc, f| Term::App(Box::new(f), Box::new(acc))),
                 ))
             },
             |i| {
@@ -292,7 +292,7 @@ fn prec<'input: 'a, 'a>(
                     fs.into_iter().fold(e, |acc, (f, er)| {
                         let a = prepend_arg(f, acc);
                         if let Some(e) = er {
-                            Expr::App(Box::new(a), Box::new(e))
+                            Term::App(Box::new(a), Box::new(e))
                         } else {
                             a
                         }
@@ -305,16 +305,16 @@ fn prec<'input: 'a, 'a>(
     }
 }
 
-fn prec_pass<'input, 'a>(g: &'a PrecedenceGraph<'input>, e: Expr<'input>) -> Expr<'input> {
+fn prec_pass<'input, 'a>(g: &'a PrecedenceGraph<'input>, e: Term<'input>) -> Term<'input> {
     match e {
-        Expr::Number(_) => e,
-        Expr::Var(_) => e,
-        Expr::App(_, _) => {
+        Term::Number(_) => e,
+        Term::Var(_) => e,
+        Term::App(_, _) => {
             // Unfold the left-recursive sequence
             let mut e = Some(e);
             let mut xs = iter::from_fn(move || {
                 Some(match e.take()? {
-                    Expr::App(next, item) => {
+                    Term::App(next, item) => {
                         e = Some(*next);
                         *item
                     }
@@ -333,16 +333,16 @@ fn prec_pass<'input, 'a>(g: &'a PrecedenceGraph<'input>, e: Expr<'input>) -> Exp
                 .1;
             result
         }
-        Expr::Abs(id, mut body) => {
+        Term::Abs(id, mut body) => {
             take_mut::take(body.as_mut(), |e| prec_pass(g, e));
-            Expr::Abs(id, body)
+            Term::Abs(id, body)
         }
     }
 }
 
 fn parse<'input, I>(
     input: I,
-) -> Result<Expr<'input>, lalrpop_util::ParseError<usize, Token<'input>, lexer::Error>>
+) -> Result<Term<'input>, lalrpop_util::ParseError<usize, Token<'input>, lexer::Error>>
 where
     I: 'input,
     I: Iterator<Item = Spanned<Token<'input>, usize, lexer::Error>>,
@@ -361,7 +361,7 @@ where
     };
     let prec_graph = PrecedenceGraph::new(vec![prec_tree]);
 
-    let expr = *fun::ExprParser::new().parse(input)?;
+    let expr = *fun::TermParser::new().parse(input)?;
     Ok(prec_pass(&prec_graph, expr))
 }
 
@@ -369,7 +369,7 @@ mod tests {
     use super::*;
     use crate::lexer::Lexer;
     use std::error;
-    use Expr::*;
+    use Term::*;
 
     #[test]
     fn test_parse_mixfix() -> Result<(), Box<dyn error::Error>> {

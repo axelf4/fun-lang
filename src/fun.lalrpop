@@ -1,5 +1,5 @@
 use crate::lexer::{self, Token};
-use crate::ast::{Expr};
+use crate::ast::{Term};
 
 grammar<'input>;
 
@@ -36,33 +36,33 @@ Comma<T>: Vec<T> = {
     }
 };
 
-Binding: (&'input str, Option<Box<Expr<'input>>>, Box<Expr<'input>>) = {
-	<x:Ident> "=" <e:Expr> => (x, None, e),
-	<x:Ident> ":" <t:Expr> "=" <e:Expr> => (x, Some(t), e),
+Binding: (&'input str, Option<Box<Term<'input>>>, Box<Term<'input>>) = {
+	<x:Ident> "=" <e:Term> => (x, None, e),
+	<x:Ident> ":" <t:Term> "=" <e:Term> => (x, Some(t), e),
 }
 
-pub Expr: Box<Expr<'input>> = {
-	Expr1,
-	"\\" <x:Ident> "->" <e:Expr1> => Box::new(Expr::Abs(x, e)),
+pub Term: Box<Term<'input>> = {
+	Term1,
+	"\\" <x:Ident> "->" <e:Term1> => Box::new(Term::Abs(x, e)),
 
-	"case" <_x:Expr> "of" "{" Comma<Arm> "}" => Box::new(Expr::Number(69)),
+	"case" <_x:Term> "of" "{" Comma<Arm> "}" => Box::new(Term::Number(69)),
 
-	"let" "{" <bs:Comma<Binding>> "}" "in" <e:Expr> => {
-		bs.into_iter().rev().fold(e, |acc, (x, _t, v)| Box::new(Expr::App(Box::new(Expr::Abs(x, acc)), v)))
+	"let" "{" <bs:Comma<Binding>> "}" "in" <e:Term> => {
+		bs.into_iter().rev().fold(e, |acc, (x, _t, v)| Box::new(Term::App(Box::new(Term::Abs(x, acc)), v)))
 	},
 };
 
-Expr1: Box<Expr<'input>> = {
-	Expr2,
-	Expr1 Expr2 => Box::new(Expr::App(<>)),
+Term1: Box<Term<'input>> = {
+	Term2,
+	Term1 Term2 => Box::new(Term::App(<>)),
 }
 
-Expr2: Box<Expr<'input>> = {
-	Num => Box::new(Expr::Number(<>)),
-	Ident => Box::new(Expr::Var(<>)),
-	"(" <Expr> ")",
+Term2: Box<Term<'input>> = {
+	Num => Box::new(Term::Number(<>)),
+	Ident => Box::new(Term::Var(<>)),
+	"(" <Term> ")",
 };
 
 Arm: () = {
-	Expr "->" Expr => {},
+	Term "->" Term => {},
 };

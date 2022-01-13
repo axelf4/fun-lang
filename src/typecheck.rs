@@ -1,4 +1,4 @@
-use crate::ast::Expr;
+use crate::ast::Term;
 use hashbrown::HashMap;
 use std::collections::VecDeque;
 use std::fmt;
@@ -85,16 +85,16 @@ impl<'input> Ctx<'input> {
     }
 }
 
-fn infer<'input, 'ctx>(state: &mut State, ctx: &'ctx Ctx, e: Expr<'input>) -> Result<Type, Error> {
+fn infer<'input, 'ctx>(state: &mut State, ctx: &'ctx Ctx, e: Term<'input>) -> Result<Type, Error> {
     Ok(match e {
-        Expr::Number(_) => Type::Number,
-        Expr::Var(id) => ctx.lookup(id).ok_or(Error::UnknownVar)?,
-        Expr::Abs(x, e) => {
+        Term::Number(_) => Type::Number,
+        Term::Var(id) => ctx.lookup(id).ok_or(Error::UnknownVar)?,
+        Term::Abs(x, e) => {
             let s = state.new_type_var();
             let t = infer(state, &ctx.insert(x, s.clone()), *e)?;
             Type::Fun(Box::new((s, t)))
         }
-        Expr::App(f, e) => {
+        Term::App(f, e) => {
             // Can be simplified
             let r = infer(state, ctx, *f)?;
             let s = infer(state, ctx, *e)?;
@@ -206,7 +206,7 @@ fn unify(constraints: Vec<Constraint>) -> Result<Substitution, Error> {
     Ok(sub)
 }
 
-pub fn typecheck<'input>(e: Expr<'input>) -> Result<Type, Error> {
+pub fn typecheck<'input>(e: Term<'input>) -> Result<Type, Error> {
     let mut state = State::new();
     let ty = infer(&mut state, &Ctx::new(), e)?;
     let sub = unify(state.constraints)?;
@@ -218,18 +218,18 @@ mod tests {
 
     #[test]
     fn test_simple_literal() {
-        assert_eq!(typecheck(Expr::Number(0)), Ok(Type::Number));
+        assert_eq!(typecheck(Term::Number(0)), Ok(Type::Number));
     }
 
     /// Try to compute the type of "λ x → x x".
     #[test]
     fn test_occurs_check() {
         assert_eq!(
-            typecheck(Expr::Abs(
+            typecheck(Term::Abs(
                 "x",
-                Box::new(Expr::App(
-                    Box::new(Expr::Var("x")),
-                    Box::new(Expr::Var("x"))
+                Box::new(Term::App(
+                    Box::new(Term::Var("x")),
+                    Box::new(Term::Var("x"))
                 ))
             )),
             Err(Error::InfiniteType)

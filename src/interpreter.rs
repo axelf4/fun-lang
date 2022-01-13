@@ -1,4 +1,4 @@
-use crate::ast::Expr;
+use crate::ast::Term;
 use std::collections::HashMap;
 use std::error;
 use std::fmt;
@@ -6,7 +6,7 @@ use std::fmt;
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Value<'input> {
     Number(i32),
-    Lambda(Env<'input>, &'input str, Expr<'input>),
+    Lambda(Env<'input>, &'input str, Term<'input>),
 }
 
 #[derive(Debug)]
@@ -45,18 +45,18 @@ impl<'input> Env<'input> {
     }
 }
 
-pub fn eval<'input, 'env>(env: &'env Env<'input>, e: Expr<'input>) -> Result<Value<'input>, Error> {
+pub fn eval<'input, 'env>(env: &'env Env<'input>, e: Term<'input>) -> Result<Value<'input>, Error> {
     Ok(match e {
-        Expr::Number(n) => Value::Number(n),
-        Expr::Var(id) => env.lookup(&id).ok_or(Error::UnknownVar)?,
-        Expr::App(a, b) => {
+        Term::Number(n) => Value::Number(n),
+        Term::Var(id) => env.lookup(&id).ok_or(Error::UnknownVar)?,
+        Term::App(a, b) => {
             if let Value::Lambda(env2, x, e) = eval(env, *a)? {
                 eval(&env2.insert(x, eval(env, *b)?), e)?
             } else {
                 return Err(Error::AppNotFun);
             }
         }
-        Expr::Abs(x, e) => Value::Lambda(env.clone(), x, *e),
+        Term::Abs(x, e) => Value::Lambda(env.clone(), x, *e),
     })
 }
 
@@ -65,7 +65,7 @@ mod tests {
 
     #[test]
     fn test_eval_int_literal() -> Result<(), Box<dyn error::Error>> {
-        assert_eq!(eval(&Env::new(), Expr::Number(42))?, Value::Number(42));
+        assert_eq!(eval(&Env::new(), Term::Number(42))?, Value::Number(42));
         Ok(())
     }
 
@@ -74,9 +74,9 @@ mod tests {
         assert_eq!(
             eval(
                 &Env::new(),
-                Expr::App(
-                    Box::new(Expr::Abs("x", Box::new(Expr::Var("x")))),
-                    Box::new(Expr::Number(4))
+                Term::App(
+                    Box::new(Term::Abs("x", Box::new(Term::Var("x")))),
+                    Box::new(Term::Number(4))
                 )
             )?,
             Value::Number(4)

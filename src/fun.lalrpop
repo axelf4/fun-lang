@@ -12,6 +12,10 @@ extern {
 		"->" => Token::Arrow,
 		"(" => Token::LParen,
 		")" => Token::RParen,
+		"=" => Token::Equals,
+		":" => Token::Colon,
+		"let" => Token::Let,
+		"in" => Token::In,
 		"case" => Token::Case,
 		"of" => Token::Of,
 		"{" => Token::LayoutStart,
@@ -32,11 +36,20 @@ Comma<T>: Vec<T> = {
     }
 };
 
+Binding: (&'input str, Option<Box<Expr<'input>>>, Box<Expr<'input>>) = {
+	<x:Ident> "=" <e:Expr> => (x, None, e),
+	<x:Ident> ":" <t:Expr> "=" <e:Expr> => (x, Some(t), e),
+}
+
 pub Expr: Box<Expr<'input>> = {
 	Expr1,
 	"\\" <x:Ident> "->" <e:Expr1> => Box::new(Expr::Abs(x, e)),
 
 	"case" <_x:Expr> "of" "{" Comma<Arm> "}" => Box::new(Expr::Number(69)),
+
+	"let" "{" <bs:Comma<Binding>> "}" "in" <e:Expr> => {
+		bs.into_iter().rev().fold(e, |acc, (x, _t, v)| Box::new(Expr::App(Box::new(Expr::Abs(x, acc)), v)))
+	},
 };
 
 Expr1: Box<Expr<'input>> = {

@@ -58,7 +58,25 @@ struct Precedence<'input> {
     sucs: Vec<Precedence<'input>>,
 }
 
-type PrecedenceGraph<'input> = [Precedence<'input>];
+struct PrecedenceGraph<'input>(Vec<Precedence<'input>>);
+
+impl<'input> PrecedenceGraph<'input> {
+    /// Returns an iterator of all nodes in this graph.
+    fn nodes(&self) -> impl Iterator<Item = &Precedence<'input>> {
+        let mut x = vec![self.0.iter()];
+        iter::from_fn(move || {
+            let item = loop {
+                if let Some(item) = x.last_mut()?.next() {
+                    break item;
+                } else {
+                    x.pop();
+                }
+            };
+            x.push(item.sucs.iter());
+            Some(item)
+        })
+    }
+}
 
 #[derive(Clone, Debug)]
 struct Input<'input, 'a>(&'a [Expr<'input>]);
@@ -131,7 +149,7 @@ where
 fn expr<'input: 'a, 'a>(
     prec_graph: &'a PrecedenceGraph<'input>,
 ) -> impl Fn(Input<'input, 'a>) -> IResult<Input<'input, 'a>, Expr<'input>> {
-    precs(prec_graph, prec_graph)
+    precs(prec_graph, &prec_graph.0)
 }
 
 fn precs<'input: 'a, 'a>(
@@ -139,7 +157,15 @@ fn precs<'input: 'a, 'a>(
     ps: &'a [Precedence<'input>],
 ) -> impl Fn(Input<'input, 'a>) -> IResult<Input<'input, 'a>, Expr<'input>> {
     |i| {
-        let mut atom = many1(expr_where(Expr::is_not_op)).map(|mut xs| {
+        let op_closed = |i| {
+            AltIter(
+                prec_graph
+                    .nodes()
+                    .map(|p| inner_at_fix(p, prec_graph, Closed)),
+            )
+            .alt_parse(i)
+        };
+        let mut atom = many1(alt((expr_where(Expr::is_not_op), op_closed))).map(|mut xs| {
             let e = xs.pop().expect("many1 did not parse 1 element?");
             xs.into_iter()
                 .rev()
@@ -163,47 +189,52 @@ impl<'input> Expr<'input> {
     }
 }
 
+fn inner_at_fix<'input: 'a, 'a>(
+    p: &'a Precedence<'input>,
+    prec_graph: &'a PrecedenceGraph<'input>,
+    fix: Fixity,
+) -> impl Fn(Input<'input, 'a>) -> IResult<Input<'input, 'a>, Expr<'input>> {
+    // Match a single specific identifier token
+    let ident = |s| {
+        expr_where(move |e| {
+            if let Expr::Var(id) = e {
+                *id == s
+            } else {
+                false
+            }
+        })
+    };
+
+    move |i| {
+        let ops = p.operators.iter().filter(move |Operator(f, _)| f == &fix);
+
+        AltIter(ops.map(|op @ Operator(_, s)| {
+            move |i| {
+                let mut res = Expr::Var(s);
+                let mut name_parts = op.name_parts();
+
+                let (mut i, _) = ident(name_parts.next().unwrap())(i)?;
+
+                while let Some(s) = name_parts.next() {
+                    let (i2, e) = expr(prec_graph)(i)?;
+                    let (i2, _) = ident(s)(i2)?;
+                    res = Expr::App(Box::new(res), Box::new(e));
+                    i = i2;
+                }
+
+                Ok((i, res))
+            }
+        }))
+        .alt_parse(i)
+    }
+}
+
+/// Parser for an expression at some precedence level.
 fn prec<'input: 'a, 'a>(
     prec_graph: &'a PrecedenceGraph<'input>,
     p: &'a Precedence<'input>,
-) -> impl FnMut(Input<'input, 'a>) -> IResult<Input<'input, 'a>, Expr<'input>> + 'a {
+) -> impl Fn(Input<'input, 'a>) -> IResult<Input<'input, 'a>, Expr<'input>> + 'a {
     move |i| {
-        // Match a single specific identifier token
-        let ident = |s| {
-            expr_where(move |e| {
-                if let Expr::Var(id) = e {
-                    *id == s
-                } else {
-                    false
-                }
-            })
-        };
-
-        let inner_at_fix = |fix| {
-            move |i| {
-                let ops = p.operators.iter().filter(move |Operator(f, _)| f == &fix);
-
-                AltIter(ops.map(|op @ Operator(_, s)| {
-                    move |i| {
-                        let mut res = Expr::Var(s);
-                        let mut name_parts = op.name_parts();
-
-                        let (mut i, _) = ident(name_parts.next().unwrap())(i)?;
-
-                        while let Some(s) = name_parts.next() {
-                            let (i2, e) = expr(prec_graph)(i)?;
-                            let (i2, _) = ident(s)(i2)?;
-                            res = Expr::App(Box::new(res), Box::new(e));
-                            i = i2;
-                        }
-
-                        Ok((i, res))
-                    }
-                }))
-                .alt_parse(i)
-            }
-        };
-
         let p_suc = precs(prec_graph, &p.sucs);
 
         fn prepend_arg<'input>(f: Expr<'input>, e: Expr<'input>) -> Expr<'input> {
@@ -213,20 +244,17 @@ fn prec<'input: 'a, 'a>(
             }
         }
 
-        let infix_non = |i| {
-            let (i, el) = p_suc(i)?;
-            let (i, f) = inner_at_fix(Infix(Associativity::Non))(i)?;
-            let (i, er) = p_suc(i)?;
-            Ok((i, Expr::App(Box::new(prepend_arg(f, el)), Box::new(er))))
-        };
-
         let x = alt((
-            inner_at_fix(Fixity::Closed),
-            infix_non,
             |i| {
-                let pre_right = alt((inner_at_fix(Fixity::Prefix), |i| {
+                let (i, el) = p_suc(i)?;
+                let (i, f) = inner_at_fix(p, prec_graph, Infix(Associativity::Non))(i)?;
+                let (i, er) = p_suc(i)?;
+                Ok((i, Expr::App(Box::new(prepend_arg(f, el)), Box::new(er))))
+            },
+            |i| {
+                let pre_right = alt((inner_at_fix(p, prec_graph, Prefix), |i| {
                     let (i, e) = p_suc(i)?;
-                    let (i, f) = inner_at_fix(Fixity::Infix(Associativity::Right))(i)?;
+                    let (i, f) = inner_at_fix(p, prec_graph, Infix(Associativity::Right))(i)?;
                     Ok((i, prepend_arg(f, e)))
                 }));
 
@@ -240,11 +268,14 @@ fn prec<'input: 'a, 'a>(
                 ))
             },
             |i| {
-                let post_left = alt((inner_at_fix(Fixity::Postfix).map(|_| todo!()), |i| {
-                    let (i, f) = inner_at_fix(Fixity::Infix(Associativity::Left))(i)?;
-                    let (i, er) = p_suc(i)?;
-                    Ok((i, (f, Some(er))))
-                }));
+                let post_left = alt((
+                    inner_at_fix(p, prec_graph, Postfix).map(|f| (f, None)),
+                    |i| {
+                        let (i, f) = inner_at_fix(p, prec_graph, Infix(Associativity::Left))(i)?;
+                        let (i, er) = p_suc(i)?;
+                        Ok((i, (f, Some(er))))
+                    },
+                ));
 
                 let (i, e) = p_suc(i)?;
                 let (i, fs) = many1(post_left)(i)?;
@@ -320,10 +351,10 @@ where
             sucs: Vec::new(),
         }],
     };
-    let prec_forest = [prec_tree];
+    let prec_graph = PrecedenceGraph(vec![prec_tree]);
 
     let expr = *fun::ExprParser::new().parse(input)?;
-    Ok(prec_pass(&prec_forest, expr))
+    Ok(prec_pass(&prec_graph, expr))
 }
 
 mod tests {

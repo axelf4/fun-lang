@@ -2,10 +2,11 @@
 use crate::ast::Expr;
 use crate::lexer::{self, Spanned, Token};
 use lalrpop_util::lalrpop_mod;
+use std::collections::HashSet;
 use std::iter;
 
 use nom::branch::alt;
-use nom::combinator::eof;
+use nom::combinator::{eof, verify};
 use nom::multi::many1;
 use nom::sequence::terminated;
 use nom::IResult;
@@ -58,12 +59,28 @@ struct Precedence<'input> {
     sucs: Vec<Precedence<'input>>,
 }
 
-struct PrecedenceGraph<'input>(Vec<Precedence<'input>>);
+struct PrecedenceGraph<'input> {
+    roots: Vec<Precedence<'input>>,
+    op_parts: HashSet<&'input str>,
+}
 
 impl<'input> PrecedenceGraph<'input> {
+    fn new(roots: Vec<Precedence<'input>>) -> Self {
+        let mut result = Self {
+            roots,
+            op_parts: Default::default(),
+        };
+        result.op_parts = result
+            .nodes()
+            .flat_map(|p| &p.operators)
+            .flat_map(|op| op.name_parts())
+            .collect();
+        result
+    }
+
     /// Returns an iterator of all nodes in this graph.
     fn nodes(&self) -> impl Iterator<Item = &Precedence<'input>> {
-        let mut x = vec![self.0.iter()];
+        let mut x = vec![self.roots.iter()];
         iter::from_fn(move || {
             let item = loop {
                 if let Some(item) = x.last_mut()?.next() {
@@ -74,6 +91,18 @@ impl<'input> PrecedenceGraph<'input> {
             };
             x.push(item.sucs.iter());
             Some(item)
+        })
+    }
+
+    fn non_op<'a>(
+        &'a self,
+    ) -> impl FnMut(Input<'input, 'a>) -> IResult<Input<'input, 'a>, Expr<'input>> {
+        verify(single_expr(), |e| {
+            if let Expr::Var(s) = e {
+                !self.op_parts.contains(s)
+            } else {
+                true
+            }
         })
     }
 }
@@ -87,14 +116,11 @@ impl<'input, 'a> nom::InputLength for Input<'input, 'a> {
     }
 }
 
-fn expr_where<'input: 'a, 'a, F>(
-    f: F,
-) -> impl FnMut(Input<'input, 'a>) -> IResult<Input<'input, 'a>, Expr<'input>>
-where
-    F: Fn(&Expr<'a>) -> bool,
-{
+/// Returns a parser for a single expression token.
+fn single_expr<'input: 'a, 'a>(
+) -> impl Fn(Input<'input, 'a>) -> IResult<Input<'input, 'a>, Expr<'input>> {
     move |i| match i.0.split_first() {
-        Some((e, rest)) if f(e) => Ok((Input(rest), e.clone())),
+        Some((e, rest)) => Ok((Input(rest), e.clone())),
         _ => Err(nom::Err::Error(nom::error::Error {
             input: i,
             code: nom::error::ErrorKind::Tag,
@@ -149,7 +175,7 @@ where
 fn expr<'input: 'a, 'a>(
     prec_graph: &'a PrecedenceGraph<'input>,
 ) -> impl Fn(Input<'input, 'a>) -> IResult<Input<'input, 'a>, Expr<'input>> {
-    precs(prec_graph, &prec_graph.0)
+    precs(prec_graph, &prec_graph.roots)
 }
 
 fn precs<'input: 'a, 'a>(
@@ -165,7 +191,7 @@ fn precs<'input: 'a, 'a>(
             )
             .alt_parse(i)
         };
-        let mut atom = many1(alt((expr_where(Expr::is_not_op), op_closed))).map(|mut xs| {
+        let mut atom = many1(alt((prec_graph.non_op(), op_closed))).map(|mut xs| {
             let e = xs.pop().expect("many1 did not parse 1 element?");
             xs.into_iter()
                 .rev()
@@ -179,31 +205,13 @@ fn precs<'input: 'a, 'a>(
     }
 }
 
-impl<'input> Expr<'input> {
-    fn is_not_op(&self) -> bool {
-        // TODO
-        match self {
-            Expr::Var(s) => !(s == &"+" || s == &"*" || s == &"[" || s == &"]"),
-            _ => true,
-        }
-    }
-}
-
 fn inner_at_fix<'input: 'a, 'a>(
     p: &'a Precedence<'input>,
     prec_graph: &'a PrecedenceGraph<'input>,
     fix: Fixity,
 ) -> impl Fn(Input<'input, 'a>) -> IResult<Input<'input, 'a>, Expr<'input>> {
     // Match a single specific identifier token
-    let ident = |s| {
-        expr_where(move |e| {
-            if let Expr::Var(id) = e {
-                *id == s
-            } else {
-                false
-            }
-        })
-    };
+    let ident = |id| verify(single_expr(), move |e| e == &Expr::Var(id));
 
     move |i| {
         let ops = p.operators.iter().filter(move |Operator(f, _)| f == &fix);
@@ -235,7 +243,7 @@ fn prec<'input: 'a, 'a>(
     p: &'a Precedence<'input>,
 ) -> impl Fn(Input<'input, 'a>) -> IResult<Input<'input, 'a>, Expr<'input>> + 'a {
     move |i| {
-        let p_suc = precs(prec_graph, &p.sucs);
+        let p_suc = precs(prec_graph, &p.sucs); // TODO Memoize
 
         fn prepend_arg<'input>(f: Expr<'input>, e: Expr<'input>) -> Expr<'input> {
             match f {
@@ -351,7 +359,7 @@ where
             sucs: Vec::new(),
         }],
     };
-    let prec_graph = PrecedenceGraph(vec![prec_tree]);
+    let prec_graph = PrecedenceGraph::new(vec![prec_tree]);
 
     let expr = *fun::ExprParser::new().parse(input)?;
     Ok(prec_pass(&prec_graph, expr))

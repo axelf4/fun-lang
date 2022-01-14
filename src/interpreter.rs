@@ -57,6 +57,8 @@ pub fn eval<'input, 'env>(env: &'env Env<'input>, e: Term<'input>) -> Result<Val
             }
         }
         Term::Abs(x, e) => Value::Lambda(env.clone(), x, *e),
+
+        _ => todo!(),
     })
 }
 

@@ -1,4 +1,5 @@
 mod ast;
+mod elaboration;
 mod interpreter;
 mod lexer;
 mod parser;

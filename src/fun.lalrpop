@@ -23,6 +23,7 @@ extern {
 		"}" => Token::LayoutEnd,
 		Num => Token::Number(<i32>),
 		Ident => Token::Ident(<&'input str>),
+		"Type" => Token::Type,
 	}
 }
 
@@ -45,6 +46,8 @@ pub Term: Box<Term<'input>> = {
 	Term1,
 	"\\" <x:Ident> "->" <e:Term1> => Box::new(Term::Abs(x, e)),
 
+	"(" <x:Ident> ":" <a:Term> ")" "->" <b:Term> => Box::new(Term::Pi(<>)),
+
 	"case" <_x:Term> "of" "{" Comma<Arm> "}" => Box::new(Term::Number(69)),
 
 	"let" "{" <bs:Comma<Binding>> "}" "in" <e:Term> => {
@@ -60,6 +63,7 @@ Term1: Box<Term<'input>> = {
 Term2: Box<Term<'input>> = {
 	Num => Box::new(Term::Number(<>)),
 	Ident => Box::new(Term::Var(<>)),
+	"Type" => Box::new(Term::Type),
 	"(" <Term> ")",
 };
 

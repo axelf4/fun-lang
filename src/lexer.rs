@@ -23,6 +23,9 @@ pub enum Token<'input> {
     #[token(":")]
     Colon,
 
+    #[token("Type")]
+    Type,
+
     #[token("case")]
     Case,
     #[token("of")]
@@ -54,6 +57,7 @@ impl<'input> fmt::Display for Token<'input> {
             RParen => write!(fmt, ")"),
             Equals => write!(fmt, "="),
             Colon => write!(fmt, ":"),
+            Type => write!(fmt, "Type"),
             Case => write!(fmt, "case"),
             Of => write!(fmt, "of"),
             Let => write!(fmt, "let"),

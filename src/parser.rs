@@ -285,8 +285,7 @@ fn prec<'input: 'a, 'a>(
 
 fn prec_pass<'input, 'a>(g: &'a PrecedenceGraph<'input>, e: Term<'input>) -> Term<'input> {
     match e {
-        Term::Number(_) => e,
-        Term::Var(_) => e,
+        Term::Number(_) | Term::Var(_) | Term::Type => e,
         Term::App(_, _) => {
             // Unfold the left-recursive sequence
             let mut e = Some(e);
@@ -315,10 +314,17 @@ fn prec_pass<'input, 'a>(g: &'a PrecedenceGraph<'input>, e: Term<'input>) -> Ter
             take_mut::take(body.as_mut(), |e| prec_pass(g, e));
             Term::Abs(id, body)
         }
+
+        Term::Pi(x, mut a, mut b) => {
+            take_mut::take(a.as_mut(), |e| prec_pass(g, e));
+            take_mut::take(b.as_mut(), |e| prec_pass(g, e));
+            Term::Pi(x, a, b)
+        }
+        _ => todo!(),
     }
 }
 
-fn parse<'input, I>(
+pub fn parse<'input, I>(
     input: I,
 ) -> Result<Term<'input>, lalrpop_util::ParseError<usize, Token<'input>, lexer::Error>>
 where

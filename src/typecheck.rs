@@ -112,6 +112,8 @@ fn infer<'input, 'ctx>(state: &mut State, ctx: &'ctx Ctx, e: Term<'input>) -> Re
                 _ => return Err(Error::AppNonFun),
             }
         }
+
+        _ => todo!(),
     })
 }
 

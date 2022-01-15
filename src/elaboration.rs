@@ -1,11 +1,9 @@
 /// Takes raw syntax and outputs core syntax.
 use crate::ast as raw;
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::error;
 use std::fmt;
 use std::ops;
-use std::rc::Rc;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Icitness {
@@ -229,7 +227,7 @@ enum MetaEntry {
 /// definition.
 ///
 /// Metavariables may be solved during unification.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct MetaCtx(Vec<MetaEntry>);
 
 impl MetaCtx {
@@ -297,9 +295,9 @@ impl fmt::Display for PartialRenaming {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct Ctx<'input> {
-    meta_ctx: Rc<RefCell<MetaCtx>>,
+    meta_ctx: MetaCtx,
 
     /// Local evaluation environment.
     env: Env,
@@ -310,9 +308,9 @@ struct Ctx<'input> {
 }
 
 impl<'input> Ctx<'input> {
-    fn new(meta_ctx: Rc<RefCell<MetaCtx>>) -> Self {
+    fn new() -> Self {
         Self {
-            meta_ctx,
+            meta_ctx: MetaCtx::new(),
             env: Env::new(),
             bds: Vec::new(),
             table: HashMap::new(),
@@ -325,7 +323,7 @@ impl<'input> Ctx<'input> {
     }
 
     fn fresh_meta(&mut self) -> Term {
-        let meta_var = self.meta_ctx.borrow_mut().fresh();
+        let meta_var = self.meta_ctx.fresh();
         let t = Term::InsertedMeta(meta_var, self.bds.clone());
         // Contextual metavariables means creating a function that
         // abstracts over the bound variables in scope.
@@ -333,12 +331,11 @@ impl<'input> Ctx<'input> {
     }
 
     fn force(&self, v: Value) -> Value {
-        let meta_ctx = self.meta_ctx.borrow();
         match v {
             Value::Flex(m, spine) => {
-                if let MetaEntry::Solved(v) = &meta_ctx[m] {
+                if let MetaEntry::Solved(v) = &self.meta_ctx[m] {
                     let v = v.clone();
-                    self.force(v.apply_spine(&*meta_ctx, spine))
+                    self.force(v.apply_spine(&self.meta_ctx, spine))
                 } else {
                     Value::Flex(m, spine)
                 }
@@ -354,17 +351,20 @@ impl<'input> Ctx<'input> {
     }
 
     fn quote(&self, l: Lvl, v: Value) -> Term {
-        let meta_ctx = self.meta_ctx.borrow();
         match self.force(v) {
             Value::Flex(m, spine) => self.quote_spine(l, Term::Meta(m), spine),
             Value::Rigid(x, spine) => self.quote_spine(l, Term::LocalVar(x.to_ix(l)), spine),
-            Value::Abs(t) => Term::Abs(Box::new(
-                self.quote(l.inc(), t.apply(&*meta_ctx, Value::Rigid(l, Spine::new()))),
-            )),
+            Value::Abs(t) => Term::Abs(Box::new(self.quote(
+                l.inc(),
+                t.apply(&self.meta_ctx, Value::Rigid(l, Spine::new())),
+            ))),
             Value::Pi(x, a, b) => Term::Pi(
                 x,
                 Box::new(self.quote(l, *a)),
-                Box::new(self.quote(l.inc(), b.apply(&*meta_ctx, Value::Rigid(l, Spine::new())))),
+                Box::new(self.quote(
+                    l.inc(),
+                    b.apply(&self.meta_ctx, Value::Rigid(l, Spine::new())),
+                )),
             ),
             Value::Type => Term::Type,
         }
@@ -372,7 +372,7 @@ impl<'input> Ctx<'input> {
 
     /// The normalization function.
     fn nf(&mut self, t: Term) -> Term {
-        let v = t.eval(&*self.meta_ctx.borrow(), &self.env);
+        let v = t.eval(&self.meta_ctx, &self.env);
         self.quote(self.lvl(), v)
     }
 
@@ -425,7 +425,7 @@ impl<'input> Ctx<'input> {
                 m,
                 &renaming.clone().lift(),
                 t.apply(
-                    &*self.meta_ctx.borrow(),
+                    &self.meta_ctx,
                     Value::Rigid(Lvl(renaming.cod), Spine::new()),
                 ),
             )?)),
@@ -437,7 +437,7 @@ impl<'input> Ctx<'input> {
                     m,
                     &renaming.clone().lift(),
                     b.apply(
-                        &*self.meta_ctx.borrow(),
+                        &self.meta_ctx,
                         Value::Rigid(Lvl(renaming.cod), Spine::new()),
                     ),
                 )?),
@@ -450,18 +450,19 @@ impl<'input> Ctx<'input> {
     /// Solve the problem:
     ///
     ///    ?α spine =? rhs
-    fn solve(&self, gamma: Lvl, m: MetaVar, spine: Spine, rhs: Value) -> Result<(), TypeError> {
+    fn solve(&mut self, gamma: Lvl, m: MetaVar, spine: Spine, rhs: Value) -> Result<(), TypeError> {
         let renaming = self
             .invert(gamma, spine)
             .ok_or(TypeError::UnificationFailure)?;
         let rhs = self.rename(m, &renaming, rhs)?;
-        let mut meta_ctx = self.meta_ctx.borrow_mut();
-        let solution = rhs.lambdas(Lvl(renaming.dom)).eval(&*meta_ctx, &Env::new());
-        meta_ctx.0[m.0] = MetaEntry::Solved(solution);
+        let solution = rhs
+            .lambdas(Lvl(renaming.dom))
+            .eval(&self.meta_ctx, &Env::new());
+        self.meta_ctx.0[m.0] = MetaEntry::Solved(solution);
         Ok(())
     }
 
-    fn unify_spine(&self, l: Lvl, s1: Spine, s2: Spine) -> Result<(), TypeError> {
+    fn unify_spine(&mut self, l: Lvl, s1: Spine, s2: Spine) -> Result<(), TypeError> {
         if s1.0.len() != s2.0.len() {
             return Err(TypeError::UnificationFailure); // rigid mismatch error
         }
@@ -470,22 +471,22 @@ impl<'input> Ctx<'input> {
             .try_for_each(|((v1, _), (v2, _))| self.unify(l, v1, v2))
     }
 
-    fn unify(&self, l: Lvl, v1: Value, v2: Value) -> Result<(), TypeError> {
+    fn unify(&mut self, l: Lvl, v1: Value, v2: Value) -> Result<(), TypeError> {
         let x = match (self.force(v1), self.force(v2)) {
             (Value::Abs(t1), Value::Abs(t2)) => self.unify(
                 l.inc(),
-                t1.apply(&*self.meta_ctx.borrow(), Value::Rigid(l, Spine::new())),
-                t2.apply(&*self.meta_ctx.borrow(), Value::Rigid(l, Spine::new())),
+                t1.apply(&self.meta_ctx, Value::Rigid(l, Spine::new())),
+                t2.apply(&self.meta_ctx, Value::Rigid(l, Spine::new())),
             ),
             (t1, Value::Abs(t2)) => self.unify(
                 l.inc(),
-                t1.apply(&*self.meta_ctx.borrow(), Value::Rigid(l, Spine::new())),
-                t2.apply(&*self.meta_ctx.borrow(), Value::Rigid(l, Spine::new())),
+                t1.apply(&self.meta_ctx, Value::Rigid(l, Spine::new())),
+                t2.apply(&self.meta_ctx, Value::Rigid(l, Spine::new())),
             ),
             (Value::Abs(t1), t2) => self.unify(
                 l.inc(),
-                t1.apply(&*self.meta_ctx.borrow(), Value::Rigid(l, Spine::new())),
-                t2.apply(&*self.meta_ctx.borrow(), Value::Rigid(l, Spine::new())),
+                t1.apply(&self.meta_ctx, Value::Rigid(l, Spine::new())),
+                t2.apply(&self.meta_ctx, Value::Rigid(l, Spine::new())),
             ),
             (Value::Type, Value::Type) => Ok(()),
 
@@ -503,12 +504,31 @@ impl<'input> Ctx<'input> {
         x
     }
 
-    /// Extend with a bound variable/definition.
-    fn bind(&mut self, x: &'input str, a: Vtype, bd: Bd) {
+    /// Run the function in this context extended with a bound
+    /// variable/definition.
+    fn with<R, F: FnOnce(&mut Ctx<'input>) -> R>(
+        &mut self,
+        x: &'input str,
+        a: Vtype,
+        bd: Bd,
+        f: F,
+    ) -> R {
         let l = self.lvl();
         self.env.0.push(Value::Rigid(l, Spine::new()));
-        self.table.insert(x, SymbolValue::Local(l, a));
         self.bds.push(bd);
+        let old_sym = self.table.insert(x, SymbolValue::Local(l, a));
+
+        let result = f(self);
+
+        if let Some(sym) = old_sym {
+            self.table.insert(x, sym);
+        } else {
+            self.table.remove(x);
+        }
+        self.bds.pop();
+        self.env.0.pop();
+
+        result
     }
 
     fn close_value(&mut self, v: Value) -> Closure {
@@ -530,13 +550,8 @@ impl<'input> Ctx<'input> {
             raw::Term::Abs(x, t) => {
                 // Find out the argument type. If no annotation:
                 // Create a new meta.
-                let a = self.fresh_meta().eval(&*self.meta_ctx.borrow(), &self.env);
-                let (t, b) = {
-                    let mut ctx2 = self.clone();
-                    ctx2.bind(x, a.clone(), Bd::Bound);
-                    ctx2
-                }
-                .infer(t.as_ref())?;
+                let a = self.fresh_meta().eval(&self.meta_ctx, &self.env);
+                let (t, b) = self.with(x, a.clone(), Bd::Bound, |ctx| ctx.infer(t.as_ref()))?;
                 (
                     Term::Abs(Box::new(t)),
                     Value::Pi(x.to_string(), Box::new(a), self.close_value(b)),
@@ -549,15 +564,10 @@ impl<'input> Ctx<'input> {
                 let (a, b) = match self.force(tty) {
                     Value::Pi(_x, a, b) => (*a, b),
                     tty => {
-                        let a = self.fresh_meta().eval(&*self.meta_ctx.borrow(), &self.env);
+                        let a = self.fresh_meta().eval(&self.meta_ctx, &self.env);
                         let b = Closure(
                             self.env.clone(),
-                            {
-                                let mut ctx2 = self.clone();
-                                ctx2.bind("x", a.clone(), Bd::Bound);
-                                ctx2
-                            }
-                            .fresh_meta(),
+                            self.with("x", a.clone(), Bd::Bound, |ctx| ctx.fresh_meta()),
                         );
                         self.unify(
                             self.lvl(),
@@ -568,8 +578,7 @@ impl<'input> Ctx<'input> {
                     }
                 };
                 let u = self.check(u, a)?;
-                let meta_ctx = self.meta_ctx.borrow();
-                let v = b.apply(&*meta_ctx, u.eval(&*meta_ctx, &self.env));
+                let v = b.apply(&self.meta_ctx, u.eval(&self.meta_ctx, &self.env));
                 (Term::App(Box::new(t), Box::new(u)), v)
             }
 
@@ -577,12 +586,9 @@ impl<'input> Ctx<'input> {
 
             raw::Term::Pi(x, a, b) => {
                 let a = self.check(a.as_ref(), Value::Type)?;
-                let b = {
-                    let mut ctx2 = self.clone();
-                    ctx2.bind(x, a.eval(&*self.meta_ctx.borrow(), &self.env), Bd::Bound);
-                    ctx2
-                }
-                .check(b.as_ref(), Value::Type)?;
+                let b = self.with(x, a.eval(&self.meta_ctx, &self.env), Bd::Bound, |ctx| {
+                    ctx.check(b.as_ref(), Value::Type)
+                })?;
                 (
                     Term::Pi(x.to_string(), Box::new(a), Box::new(b)),
                     Value::Type,
@@ -591,7 +597,7 @@ impl<'input> Ctx<'input> {
 
             raw::Term::Hole => {
                 let t = self.fresh_meta();
-                let a = self.fresh_meta().eval(&*self.meta_ctx.borrow(), &self.env);
+                let a = self.fresh_meta().eval(&self.meta_ctx, &self.env);
                 (t, a)
             }
 
@@ -601,20 +607,18 @@ impl<'input> Ctx<'input> {
 
     fn check(&mut self, t: &raw::Term<'input>, a: Vtype) -> Result<Term, TypeError> {
         Ok(match (t, self.force(a)) {
-            (raw::Term::Abs(x, t), Value::Pi(_, a, b)) => Term::Abs(Box::new(
-                {
-                    let mut ctx2 = self.clone();
-                    ctx2.bind(x, *a, Bd::Bound);
-                    ctx2
-                }
-                .check(
-                    t.as_ref(),
-                    b.apply(
-                        &*self.meta_ctx.borrow(),
-                        Value::Rigid(self.lvl(), Spine::new()),
-                    ),
-                )?,
-            )),
+            (raw::Term::Abs(x, t), Value::Pi(_, a, b)) => {
+                let l = self.lvl();
+                Term::Abs(Box::new(self.with(x, *a, Bd::Bound, |ctx| {
+                    let x = ctx.check(
+                        t.as_ref(),
+                        b.apply(&ctx.meta_ctx, Value::Rigid(l, Spine::new())),
+                    );
+                    x
+                })?))
+            }
+
+            (raw::Term::Hole, _) => self.fresh_meta(),
 
             (t, expected) => {
                 let (t, inferred) = self.infer(t)?;
@@ -626,8 +630,7 @@ impl<'input> Ctx<'input> {
 }
 
 pub fn elaborate<'input>(t: &raw::Term<'input>) -> Result<(Term, Term), TypeError> {
-    let meta_ctx = Rc::new(RefCell::new(MetaCtx::new()));
-    let mut ctx = Ctx::new(meta_ctx);
+    let mut ctx = Ctx::new();
     let (t, vty) = ctx.infer(t)?;
     Ok((t, ctx.quote(ctx.lvl(), vty)))
 }

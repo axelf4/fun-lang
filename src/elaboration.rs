@@ -179,15 +179,15 @@ impl Value {
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub enum TypeError {
+pub enum Error {
     // Mismatch(Term, Term),
     NotInScope(String),
     UnificationFailure,
 }
 
-impl fmt::Display for TypeError {
+impl fmt::Display for Error {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
-        use TypeError::*;
+        use Error::*;
         match self {
             // Mismatch(a, b) => write!(fmt, "The types {:?} and {:?} do not match.", a, b),
             NotInScope(x) => write!(fmt, "Could not find variable {}.", x),
@@ -196,7 +196,7 @@ impl fmt::Display for TypeError {
     }
 }
 
-impl error::Error for TypeError {}
+impl error::Error for Error {}
 
 // /// Pair of unforced type and forced type.
 // struct Gty(Value, Value);
@@ -396,9 +396,9 @@ impl<'input> Ctx<'input> {
     }
 
     /// Perform the renaming on rhs, while checking for `m` occurrences.
-    fn rename(&self, m: MetaVar, renaming: &PartialRenaming, v: Value) -> Result<Term, TypeError> {
+    fn rename(&self, m: MetaVar, renaming: &PartialRenaming, v: Value) -> Result<Term, Error> {
         Ok(match self.force(v) {
-            Value::Flex(m2, _) if m == m2 => return Err(TypeError::UnificationFailure),
+            Value::Flex(m2, _) if m == m2 => return Err(Error::UnificationFailure),
             Value::Flex(m2, spine) => {
                 spine.0.into_iter().try_fold(Term::Meta(m2), |t, (u, _)| {
                     Ok(Term::App(
@@ -409,7 +409,7 @@ impl<'input> Ctx<'input> {
             }
 
             Value::Rigid(x, spine) => {
-                let x2 = *renaming.map.get(&x).ok_or(TypeError::UnificationFailure)?;
+                let x2 = *renaming.map.get(&x).ok_or(Error::UnificationFailure)?;
                 spine.0.into_iter().try_fold(
                     Term::LocalVar(x2.to_ix(Lvl(renaming.dom))),
                     |t, (u, _)| {
@@ -450,10 +450,8 @@ impl<'input> Ctx<'input> {
     /// Solve the problem:
     ///
     ///    ?α spine =? rhs
-    fn solve(&mut self, gamma: Lvl, m: MetaVar, spine: Spine, rhs: Value) -> Result<(), TypeError> {
-        let renaming = self
-            .invert(gamma, spine)
-            .ok_or(TypeError::UnificationFailure)?;
+    fn solve(&mut self, gamma: Lvl, m: MetaVar, spine: Spine, rhs: Value) -> Result<(), Error> {
+        let renaming = self.invert(gamma, spine).ok_or(Error::UnificationFailure)?;
         let rhs = self.rename(m, &renaming, rhs)?;
         let solution = rhs
             .lambdas(Lvl(renaming.dom))
@@ -462,16 +460,16 @@ impl<'input> Ctx<'input> {
         Ok(())
     }
 
-    fn unify_spine(&mut self, l: Lvl, s1: Spine, s2: Spine) -> Result<(), TypeError> {
+    fn unify_spine(&mut self, l: Lvl, s1: Spine, s2: Spine) -> Result<(), Error> {
         if s1.0.len() != s2.0.len() {
-            return Err(TypeError::UnificationFailure); // rigid mismatch error
+            return Err(Error::UnificationFailure); // rigid mismatch error
         }
         s1.0.into_iter()
             .zip(s2.0)
             .try_for_each(|((v1, _), (v2, _))| self.unify(l, v1, v2))
     }
 
-    fn unify(&mut self, l: Lvl, v1: Value, v2: Value) -> Result<(), TypeError> {
+    fn unify(&mut self, l: Lvl, v1: Value, v2: Value) -> Result<(), Error> {
         let x = match (self.force(v1), self.force(v2)) {
             (Value::Abs(t1), Value::Abs(t2)) => self.unify(
                 l.inc(),
@@ -499,7 +497,7 @@ impl<'input> Ctx<'input> {
 
             (Value::Flex(m, sp), v) => self.solve(l, m, sp, v),
             (v, Value::Flex(m, sp)) => self.solve(l, m, sp, v),
-            _ => Err(TypeError::UnificationFailure), // rigid mismatch error
+            _ => Err(Error::UnificationFailure), // rigid mismatch error
         };
         x
     }
@@ -535,13 +533,13 @@ impl<'input> Ctx<'input> {
         Closure(self.env.clone(), self.quote(self.lvl().inc(), v))
     }
 
-    fn infer(&mut self, term: &raw::Term<'input>) -> Result<(Term, Vtype), TypeError> {
+    fn infer(&mut self, term: &raw::Term<'input>) -> Result<(Term, Vtype), Error> {
         Ok(match term {
             raw::Term::Var(x) => {
                 match self
                     .table
                     .get(x)
-                    .ok_or_else(|| TypeError::NotInScope(x.to_string()))?
+                    .ok_or_else(|| Error::NotInScope(x.to_string()))?
                 {
                     SymbolValue::Local(x, a) => (Term::LocalVar(x.to_ix(self.lvl())), a.clone()),
                 }
@@ -605,7 +603,7 @@ impl<'input> Ctx<'input> {
         })
     }
 
-    fn check(&mut self, t: &raw::Term<'input>, a: Vtype) -> Result<Term, TypeError> {
+    fn check(&mut self, t: &raw::Term<'input>, a: Vtype) -> Result<Term, Error> {
         Ok(match (t, self.force(a)) {
             (raw::Term::Abs(x, t), Value::Pi(_, a, b)) => {
                 let l = self.lvl();
@@ -629,7 +627,7 @@ impl<'input> Ctx<'input> {
     }
 }
 
-pub fn elaborate<'input>(t: &raw::Term<'input>) -> Result<(Term, Term), TypeError> {
+pub fn elaborate<'input>(t: &raw::Term<'input>) -> Result<(Term, Term), Error> {
     let mut ctx = Ctx::new();
     let (t, vty) = ctx.infer(t)?;
     Ok((t, ctx.quote(ctx.lvl(), vty)))
@@ -666,5 +664,20 @@ mod tests {
             )
         );
         Ok(())
+    }
+
+    /// Try to compute the type of "λ x → x x".
+    #[test]
+    fn test_occurs_check() {
+        assert_eq!(
+            elaborate(&raw::Term::Abs(
+                "x",
+                Box::new(raw::Term::App(
+                    Box::new(raw::Term::Var("x")),
+                    Box::new(raw::Term::Var("x"))
+                ))
+            )),
+            Err(Error::UnificationFailure)
+        );
     }
 }

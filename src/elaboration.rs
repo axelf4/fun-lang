@@ -476,12 +476,7 @@ impl<'input> Ctx<'input> {
                 t1.apply(&self.meta_ctx, Value::Rigid(l, Spine::new())),
                 t2.apply(&self.meta_ctx, Value::Rigid(l, Spine::new())),
             ),
-            (t1, Value::Abs(t2)) => self.unify(
-                l.inc(),
-                t1.apply(&self.meta_ctx, Value::Rigid(l, Spine::new())),
-                t2.apply(&self.meta_ctx, Value::Rigid(l, Spine::new())),
-            ),
-            (Value::Abs(t1), t2) => self.unify(
+            (t1, Value::Abs(t2)) | (Value::Abs(t2), t1) => self.unify(
                 l.inc(),
                 t1.apply(&self.meta_ctx, Value::Rigid(l, Spine::new())),
                 t2.apply(&self.meta_ctx, Value::Rigid(l, Spine::new())),
@@ -495,8 +490,7 @@ impl<'input> Ctx<'input> {
                 self.unify_spine(l, sp1, sp2)
             }
 
-            (Value::Flex(m, sp), v) => self.solve(l, m, sp, v),
-            (v, Value::Flex(m, sp)) => self.solve(l, m, sp, v),
+            (Value::Flex(m, sp), v) | (v, Value::Flex(m, sp)) => self.solve(l, m, sp, v),
             _ => Err(Error::UnificationFailure), // rigid mismatch error
         };
         x

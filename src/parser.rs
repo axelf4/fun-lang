@@ -1,8 +1,10 @@
-/// Mixfix expression parser.
+/// Mixfix operator parser.
 use crate::ast::Term;
 use crate::lexer::{self, Spanned, Token};
 use lalrpop_util::lalrpop_mod;
 use std::collections::HashSet;
+use std::error;
+use std::fmt;
 use std::iter;
 
 use nom::IResult;
@@ -14,6 +16,34 @@ use nom::{
 };
 
 lalrpop_mod!(pub fun);
+
+#[derive(Debug)]
+pub enum Error<'input> {
+    LalrpopError(lalrpop_util::ParseError<usize, Token<'input>, lexer::Error<'input>>),
+    MixfixError,
+}
+
+impl<'input> From<lalrpop_util::ParseError<usize, Token<'input>, lexer::Error<'input>>>
+    for Error<'input>
+{
+    fn from(x: lalrpop_util::ParseError<usize, Token<'input>, lexer::Error<'input>>) -> Self {
+        Error::LalrpopError(x)
+    }
+}
+
+impl<'input> fmt::Display for Error<'input> {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Error::LalrpopError(e) => e.fmt(fmt),
+            Error::MixfixError => write!(
+                fmt,
+                "failed to parse mixfix operator wrt. associativity/precedence"
+            ),
+        }
+    }
+}
+
+impl<'input> error::Error for Error<'input> {}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Associativity {
@@ -311,13 +341,16 @@ fn prec<'input: 'a, 'a>(
     }
 }
 
-fn prec_pass<'input, 'a>(g: &'a mut PrecedenceGraph<'input>, e: Term<'input>) -> Term<'input> {
-    match e {
+fn prec_pass<'input, 'a>(
+    g: &'a mut PrecedenceGraph<'input>,
+    e: Term<'input>,
+) -> Result<Term<'input>, Error<'input>> {
+    Ok(match e {
         Term::Number(_) | Term::Var(_) | Term::Type | Term::Hole => e,
         Term::App(_, _) => {
             // Unfold the left-recursive sequence
             let mut e = Some(e);
-            let mut xs = iter::from_fn(move || {
+            let mut xs: Vec<_> = iter::from_fn(move || {
                 Some(match e.take()? {
                     Term::App(next, item) => {
                         e = Some(*next);
@@ -330,33 +363,30 @@ fn prec_pass<'input, 'a>(g: &'a mut PrecedenceGraph<'input>, e: Term<'input>) ->
                 })
             })
             .map(|e| prec_pass(g, e))
-            .collect::<Vec<_>>();
+            .collect::<Result<_, _>>()?;
             xs.reverse();
 
-            let result = alt_iter(g.roots.iter().map(|p| all_consuming(prec(g, p))))(Input(&xs))
-                .expect("Failed to parse operator precedence")
-                .1;
-            result
+            let (_i, e) = alt_iter(g.roots.iter().map(|p| all_consuming(prec(g, p))))(Input(&xs))
+                .map_err(|_e| Error::MixfixError)?;
+            e
         }
-        Term::Abs(x, mut t) => {
-            g.with_op(x, |g| take_mut::take(t.as_mut(), |e| prec_pass(g, e)));
-            Term::Abs(x, t)
+        Term::Abs(x, t) => {
+            let t = g.with_op(x, |g| prec_pass(g, *t))?;
+            Term::Abs(x, Box::new(t))
         }
 
-        Term::Pi(x, mut a, mut b) => {
-            take_mut::take(a.as_mut(), |e| prec_pass(g, e));
-            g.with_op(x, |g| take_mut::take(b.as_mut(), |e| prec_pass(g, e)));
-            Term::Pi(x, a, b)
+        Term::Pi(x, a, b) => {
+            let a = prec_pass(g, *a)?;
+            let b = g.with_op(x, |g| prec_pass(g, *b))?;
+            Term::Pi(x, Box::new(a), Box::new(b))
         }
-    }
+    })
 }
 
-pub fn parse<'input, I>(
-    input: I,
-) -> Result<Term<'input>, lalrpop_util::ParseError<usize, Token<'input>, lexer::Error>>
+pub fn parse<'input, I>(input: I) -> Result<Term<'input>, Error<'input>>
 where
     I: 'input,
-    I: Iterator<Item = Spanned<Token<'input>, usize, lexer::Error>>,
+    I: Iterator<Item = Spanned<Token<'input>, usize, lexer::Error<'input>>>,
 {
     use Associativity::*;
 
@@ -373,7 +403,7 @@ where
     let mut prec_graph = PrecedenceGraph::new(vec![prec_tree]);
 
     let expr = *fun::TermParser::new().parse(input)?;
-    Ok(prec_pass(&mut prec_graph, expr))
+    prec_pass(&mut prec_graph, expr)
 }
 
 mod tests {

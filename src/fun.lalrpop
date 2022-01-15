@@ -5,7 +5,7 @@ grammar<'input>;
 
 extern {
 	type Location = usize;
-	type Error = lexer::Error;
+	type Error = lexer::Error<'input>;
 
 	enum Token<'input> {
 		"\\" => Token::BackSlash,

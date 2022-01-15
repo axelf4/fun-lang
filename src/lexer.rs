@@ -71,11 +71,11 @@ impl<'input> fmt::Display for Token<'input> {
 }
 
 #[derive(PartialEq, Eq, Debug)]
-pub struct Error;
+pub struct Error<'input>(&'input str);
 
-impl<'input> fmt::Display for Error {
+impl<'input> fmt::Display for Error<'input> {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
-        write!(fmt, "error")
+        write!(fmt, "failed to lex the string ‘{}’", self.0)
     }
 }
 
@@ -156,7 +156,7 @@ impl<'input> Lexer<'input> {
 }
 
 impl<'input> Iterator for Lexer<'input> {
-    type Item = Spanned<Token<'input>, usize, Error>;
+    type Item = Spanned<Token<'input>, usize, Error<'input>>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if let Some(item) = self.next.pop() {
@@ -172,8 +172,7 @@ impl<'input> Iterator for Lexer<'input> {
             return self.next.pop().map(Ok);
         };
         if let Token::Error = token {
-            self.cursor;
-            return Some(Err(Error));
+            return Some(Err(Error(&self.input[start..end])));
         }
         self.next.push((start, token, end));
 

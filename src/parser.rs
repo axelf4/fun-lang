@@ -10,7 +10,7 @@ use nom::Parser as _;
 use nom::{
     branch::alt,
     combinator::{all_consuming, verify},
-    multi::many1,
+    multi::{fold_many1, many1},
 };
 
 lalrpop_mod!(pub fun);
@@ -32,7 +32,7 @@ enum Fixity {
 
 use Fixity::*;
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 struct Operator<'a>(Fixity, &'a str);
 
 impl<'a> Operator<'a> {
@@ -105,6 +105,32 @@ impl<'input> PrecedenceGraph<'input> {
                 true
             }
         })
+    }
+
+    fn with_op<R>(&mut self, name: &'input str, f: impl FnOnce(&mut Self) -> R) -> R {
+        let op = if let Some(op) = Operator::from_str(Associativity::Non, name) {
+            op
+        } else {
+            return f(self);
+        };
+        self.roots.push(Precedence {
+            operators: vec![op],
+            sucs: Vec::new(),
+        });
+        // self.roots.reverse();
+        let existing_parts: Vec<_> = op
+            .name_parts()
+            .filter(|part| !self.op_parts.insert(part))
+            .collect();
+
+        let result = f(self);
+
+        existing_parts
+            .into_iter()
+            .for_each(|part| debug_assert!(self.op_parts.remove(part)));
+        self.roots.pop();
+
+        result
     }
 }
 
@@ -264,18 +290,20 @@ fn prec<'input: 'a, 'a>(
                 ));
 
                 let (i, e) = p_suc(i)?;
-                let (i, fs) = many1(post_left)(i)?;
-                Ok((
-                    i,
-                    fs.into_iter().fold(e, |acc, (f, er)| {
+                let mut e = Some(e);
+                let x = fold_many1(
+                    post_left,
+                    || e.take().unwrap(),
+                    |acc, (f, er)| {
                         let a = prepend_arg(f, acc);
                         if let Some(e) = er {
                             Term::App(Box::new(a), Box::new(e))
                         } else {
                             a
                         }
-                    }),
-                ))
+                    },
+                )(i);
+                x
             },
             |i| p_suc(i),
         ))(i);
@@ -283,9 +311,9 @@ fn prec<'input: 'a, 'a>(
     }
 }
 
-fn prec_pass<'input, 'a>(g: &'a PrecedenceGraph<'input>, e: Term<'input>) -> Term<'input> {
+fn prec_pass<'input, 'a>(g: &'a mut PrecedenceGraph<'input>, e: Term<'input>) -> Term<'input> {
     match e {
-        Term::Number(_) | Term::Var(_) | Term::Type => e,
+        Term::Number(_) | Term::Var(_) | Term::Type | Term::Hole => e,
         Term::App(_, _) => {
             // Unfold the left-recursive sequence
             let mut e = Some(e);
@@ -305,22 +333,21 @@ fn prec_pass<'input, 'a>(g: &'a PrecedenceGraph<'input>, e: Term<'input>) -> Ter
             .collect::<Vec<_>>();
             xs.reverse();
 
-            let result = all_consuming(expr(g))(Input(&xs))
+            let result = alt_iter(g.roots.iter().map(|p| all_consuming(prec(g, p))))(Input(&xs))
                 .expect("Failed to parse operator precedence")
                 .1;
             result
         }
-        Term::Abs(id, mut body) => {
-            take_mut::take(body.as_mut(), |e| prec_pass(g, e));
-            Term::Abs(id, body)
+        Term::Abs(x, mut t) => {
+            g.with_op(x, |g| take_mut::take(t.as_mut(), |e| prec_pass(g, e)));
+            Term::Abs(x, t)
         }
 
         Term::Pi(x, mut a, mut b) => {
             take_mut::take(a.as_mut(), |e| prec_pass(g, e));
-            take_mut::take(b.as_mut(), |e| prec_pass(g, e));
+            g.with_op(x, |g| take_mut::take(b.as_mut(), |e| prec_pass(g, e)));
             Term::Pi(x, a, b)
         }
-        _ => todo!(),
     }
 }
 
@@ -343,10 +370,10 @@ where
             sucs: Vec::new(),
         }],
     };
-    let prec_graph = PrecedenceGraph::new(vec![prec_tree]);
+    let mut prec_graph = PrecedenceGraph::new(vec![prec_tree]);
 
     let expr = *fun::TermParser::new().parse(input)?;
-    Ok(prec_pass(&prec_graph, expr))
+    Ok(prec_pass(&mut prec_graph, expr))
 }
 
 mod tests {
@@ -396,6 +423,18 @@ mod tests {
         let expr = parse(Lexer::new("case 0 of"))?;
         assert_eq!(expr, Number(69));
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_bound_mixfix() -> Result<(), Box<dyn error::Error>> {
+        assert_eq!(
+            parse(Lexer::new(r"\_⁻¹ -> x ⁻¹"))?,
+            Abs(
+                "_⁻¹",
+                Box::new(App(Box::new(Var("_⁻¹")), Box::new(Var("x"))))
+            )
+        );
         Ok(())
     }
 }

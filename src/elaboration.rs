@@ -32,6 +32,7 @@ impl Lvl {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Bd {
     Bound,
+    #[allow(unused)]
     Defined,
 }
 
@@ -498,12 +499,12 @@ impl<'input> Ctx<'input> {
 
     /// Run the function in this context extended with a bound
     /// variable/definition.
-    fn with<R, F: FnOnce(&mut Ctx<'input>) -> R>(
+    fn with<R>(
         &mut self,
         x: &'input str,
         a: Vtype,
         bd: Bd,
-        f: F,
+        f: impl FnOnce(&mut Ctx<'input>) -> R,
     ) -> R {
         let l = self.lvl();
         self.env.0.push(Value::Rigid(l, Spine::new()));

@@ -12,5 +12,6 @@ pub enum Term<'input> {
     /// The dependent function type (`(x : A) -> B`).
     Pi(&'input str, Box<Term<'input>>, Box<Term<'input>>),
     /// `_`.
+    #[allow(unused)]
     Hole,
 }

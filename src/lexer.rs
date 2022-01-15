@@ -5,9 +5,9 @@ use std::ops::Range;
 
 #[derive(Logos, Clone, Copy, PartialEq, Debug)]
 pub enum Token<'input> {
-    #[regex("-?[0-9]+", |lex| lex.slice().parse(), priority = 100)]
+    #[regex("-?[0-9]+", |lex| lex.slice().parse(), priority = 2)]
     Number(i32),
-    #[regex(r#"[[:^space:]--[\\.()@"]]+"#)]
+    #[regex(r#"[^\p{Pattern_White_Space}\p{gc=Private_Use}\p{gc=Control}\p{Noncharacter_Code_Point}()\\.:@"]+"#)]
     Ident(&'input str),
 
     #[token(r"\")]
@@ -40,7 +40,7 @@ pub enum Token<'input> {
     LayoutEnd,
 
     #[error]
-    #[regex(r"[ \n\f]+", logos::skip)]
+    #[regex(r"[\p{Pattern_White_Space}--\t]+", logos::skip)]
     #[regex(r"--.*", logos::skip)]
     Error,
 }
@@ -172,6 +172,7 @@ impl<'input> Iterator for Lexer<'input> {
             return self.next.pop().map(Ok);
         };
         if let Token::Error = token {
+            self.cursor;
             return Some(Err(Error));
         }
         self.next.push((start, token, end));
@@ -181,7 +182,7 @@ impl<'input> Iterator for Lexer<'input> {
             self.input[self.cursor..start]
                 .chars()
                 .fold(self.column, |acc, ch| match ch {
-                    '\n' => {
+                    '\n' | '\r' | /* form feed */ '\x0C' => {
                         newline = true;
                         0
                     }

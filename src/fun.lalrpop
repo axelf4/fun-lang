@@ -1,5 +1,6 @@
 use crate::lexer::{self, Token};
 use crate::ast::{Term};
+use crate::elaboration::Icitness::*;
 
 grammar<'input>;
 
@@ -44,20 +45,20 @@ Binding: (&'input str, Option<Box<Term<'input>>>, Box<Term<'input>>) = {
 
 pub Term: Box<Term<'input>> = {
 	Term1,
-	"\\" <x:Ident> "->" <e:Term1> => Box::new(Term::Abs(x, e)),
+	"\\" <x:Ident> "->" <e:Term1> => Box::new(Term::Abs(Explicit, x, e)),
 
 	"(" <x:Ident> ":" <a:Term> ")" "->" <b:Term> => Box::new(Term::Pi(<>)),
 
 	"case" <_x:Term> "of" "{" Comma<Arm> "}" => Box::new(Term::Number(69)),
 
 	"let" "{" <bs:Comma<Binding>> "}" "in" <e:Term> => {
-		bs.into_iter().rev().fold(e, |acc, (x, _t, v)| Box::new(Term::App(Box::new(Term::Abs(x, acc)), v)))
+		bs.into_iter().rev().fold(e, |acc, (x, _t, v)| Box::new(Term::App(Box::new(Term::Abs(Explicit, x, acc)), Explicit, v)))
 	},
 };
 
 Term1: Box<Term<'input>> = {
 	Term2,
-	Term1 Term2 => Box::new(Term::App(<>)),
+	<a:Term1> <b:Term2> => Box::new(Term::App(a, Explicit, b)),
 }
 
 Term2: Box<Term<'input>> = {

@@ -1,11 +1,10 @@
 /// Mixfix operator parser.
 use crate::ast::Term;
+use crate::elaboration::Icitness::*;
 use crate::lexer::{self, Spanned, Token};
 use lalrpop_util::lalrpop_mod;
 use std::collections::HashSet;
-use std::error;
-use std::fmt;
-use std::iter;
+use std::{error, fmt, iter, slice};
 
 use nom::IResult;
 use nom::Parser as _;
@@ -13,6 +12,7 @@ use nom::{
     branch::alt,
     combinator::{all_consuming, verify},
     multi::{fold_many1, many1},
+    sequence::terminated,
 };
 
 lalrpop_mod!(pub fun);
@@ -147,7 +147,6 @@ impl<'input> PrecedenceGraph<'input> {
             operators: vec![op],
             sucs: Vec::new(),
         });
-        // self.roots.reverse();
         let existing_parts: Vec<_> = op
             .name_parts()
             .filter(|part| !self.op_parts.insert(part))
@@ -165,23 +164,26 @@ impl<'input> PrecedenceGraph<'input> {
 }
 
 #[derive(Clone, Debug)]
-struct Input<'input, 'a>(&'a [Term<'input>]);
+struct Input<'input, 'a>(iter::Rev<slice::Iter<'a, Term<'input>>>);
 
 impl<'input, 'a> nom::InputLength for Input<'input, 'a> {
     fn input_len(&self) -> usize {
-        self.0.len()
+        self.0.size_hint().0
     }
 }
 
 /// Returns a parser for a single expression token.
 fn single_expr<'input: 'a, 'a>(
 ) -> impl Fn(Input<'input, 'a>) -> IResult<Input<'input, 'a>, &'a Term<'input>> {
-    move |i| match i.0.split_first() {
-        Some((ref e, rest)) => Ok((Input(rest), e)),
-        _ => Err(nom::Err::Error(nom::error::Error {
-            input: i,
-            code: nom::error::ErrorKind::Tag,
-        })),
+    move |i| {
+        let mut i2 = i.clone();
+        match i2.0.next() {
+            Some(x) => Ok((i2, x)),
+            _ => Err(nom::Err::Error(nom::error::Error {
+                input: i,
+                code: nom::error::ErrorKind::Tag,
+            })),
+        }
     }
 }
 
@@ -230,7 +232,7 @@ fn precs<'input: 'a, 'a>(
                 let e = xs.pop().expect("many1 did not parse 1 element?");
                 xs.into_iter()
                     .rev()
-                    .fold(e, |acc, f| Term::App(Box::new(f), Box::new(acc)))
+                    .fold(e, |acc, f| Term::App(Box::new(f), Explicit, Box::new(acc)))
             });
         if ps.is_empty() {
             atom.parse(i)
@@ -257,11 +259,9 @@ fn inner_at_fix<'input: 'a, 'a>(
                 let mut name_parts = op.name_parts();
 
                 let (mut i, _) = ident(name_parts.next().unwrap())(i)?;
-
                 while let Some(s) = name_parts.next() {
-                    let (i2, e) = expr(prec_graph)(i)?;
-                    let (i2, _) = ident(s)(i2)?;
-                    res = Term::App(Box::new(res), Box::new(e));
+                    let (i2, e) = terminated(expr(prec_graph), ident(s))(i)?;
+                    res = Term::App(Box::new(res), Explicit, Box::new(e));
                     i = i2;
                 }
 
@@ -281,8 +281,10 @@ fn prec<'input: 'a, 'a>(
 
         fn prepend_arg<'input>(f: Term<'input>, e: Term<'input>) -> Term<'input> {
             match f {
-                Term::App(f, e2) => Term::App(Box::new(Term::App(f, Box::new(e))), e2),
-                _ => Term::App(Box::new(f), Box::new(e)),
+                Term::App(f, i, e2) => {
+                    Term::App(Box::new(Term::App(f, Explicit, Box::new(e))), Explicit, e2)
+                }
+                _ => Term::App(Box::new(f), Explicit, Box::new(e)),
             }
         }
 
@@ -291,7 +293,10 @@ fn prec<'input: 'a, 'a>(
                 let (i, el) = p_suc(i)?;
                 let (i, f) = inner_at_fix(prec_graph, p, Infix(Associativity::Non))(i)?;
                 let (i, er) = p_suc(i)?;
-                Ok((i, Term::App(Box::new(prepend_arg(f, el)), Box::new(er))))
+                Ok((
+                    i,
+                    Term::App(Box::new(prepend_arg(f, el)), Explicit, Box::new(er)),
+                ))
             },
             |i| {
                 let pre_right = alt((inner_at_fix(prec_graph, p, Prefix), |i| {
@@ -306,7 +311,7 @@ fn prec<'input: 'a, 'a>(
                     i,
                     fs.into_iter()
                         .rev()
-                        .fold(e, |acc, f| Term::App(Box::new(f), Box::new(acc))),
+                        .fold(e, |acc, f| Term::App(Box::new(f), Explicit, Box::new(acc))),
                 ))
             },
             |i| {
@@ -327,7 +332,7 @@ fn prec<'input: 'a, 'a>(
                     |acc, (f, er)| {
                         let a = prepend_arg(f, acc);
                         if let Some(e) = er {
-                            Term::App(Box::new(a), Box::new(e))
+                            Term::App(Box::new(a), Explicit, Box::new(e))
                         } else {
                             a
                         }
@@ -347,12 +352,14 @@ fn prec_pass<'input, 'a>(
 ) -> Result<Term<'input>, Error<'input>> {
     Ok(match e {
         Term::Number(_) | Term::Var(_) | Term::Type | Term::Hole => e,
-        Term::App(_, _) => {
+        Term::App(_, i, _) => {
+            assert!(i == Explicit);
             // Unfold the left-recursive sequence
             let mut e = Some(e);
-            let mut xs: Vec<_> = iter::from_fn(move || {
+            let xs: Vec<_> = iter::from_fn(move || {
                 Some(match e.take()? {
-                    Term::App(next, item) => {
+                    Term::App(next, i, item) => {
+                        assert!(i == Explicit); // TODO
                         e = Some(*next);
                         *item
                     }
@@ -364,15 +371,15 @@ fn prec_pass<'input, 'a>(
             })
             .map(|e| prec_pass(g, e))
             .collect::<Result<_, _>>()?;
-            xs.reverse();
 
-            let (_i, e) = alt_iter(g.roots.iter().map(|p| all_consuming(prec(g, p))))(Input(&xs))
-                .map_err(|_e| Error::MixfixError)?;
+            let (_i, e) =
+                alt_iter(g.roots.iter().map(|p| all_consuming(prec(g, p))))(Input(xs.iter().rev()))
+                    .map_err(|_e| Error::MixfixError)?;
             e
         }
-        Term::Abs(x, t) => {
+        Term::Abs(i, x, t) => {
             let t = g.with_op(x, |g| prec_pass(g, *t))?;
-            Term::Abs(x, Box::new(t))
+            Term::Abs(i, x, Box::new(t))
         }
 
         Term::Pi(x, a, b) => {
@@ -419,19 +426,25 @@ mod tests {
             App(
                 Box::new(App(
                     Box::new(Var("_+_")),
+                    Explicit,
                     Box::new(App(
-                        Box::new(App(Box::new(Var("_+_")), Box::new(Number(1)))),
+                        Box::new(App(Box::new(Var("_+_")), Explicit, Box::new(Number(1)))),
+                        Explicit,
                         Box::new(App(
-                            Box::new(App(Box::new(Var("[_]_")), Box::new(Var("x")))),
+                            Box::new(App(Box::new(Var("[_]_")), Explicit, Box::new(Var("x")))),
+                            Explicit,
                             Box::new(App(
-                                Box::new(App(Box::new(Var("_*_")), Box::new(Number(2)))),
+                                Box::new(App(Box::new(Var("_*_")), Explicit, Box::new(Number(2)))),
+                                Explicit,
                                 Box::new(Number(3))
                             ))
                         ))
                     ))
                 )),
+                Explicit,
                 Box::new(App(
-                    Box::new(App(Box::new(Var("_*_")), Box::new(Number(4)))),
+                    Box::new(App(Box::new(Var("_*_")), Explicit, Box::new(Number(4)))),
+                    Explicit,
                     Box::new(Number(5))
                 ))
             )
@@ -443,7 +456,11 @@ mod tests {
     fn test_parse_omega() -> Result<(), Box<dyn error::Error>> {
         assert_eq!(
             parse(Lexer::new(r"\x -> x x"))?,
-            Abs("x", Box::new(App(Box::new(Var("x")), Box::new(Var("x")))))
+            Abs(
+                Explicit,
+                "x",
+                Box::new(App(Box::new(Var("x")), Explicit, Box::new(Var("x"))))
+            )
         );
         Ok(())
     }
@@ -460,9 +477,11 @@ mod tests {
     fn test_parse_bound_mixfix() -> Result<(), Box<dyn error::Error>> {
         assert_eq!(
             parse(Lexer::new(r"\_⁻¹ -> x ⁻¹"))?,
+            // parse(Lexer::new(r"\_⁻¹ -> [ x ⁻¹ ] 3"))?,
             Abs(
+                Explicit,
                 "_⁻¹",
-                Box::new(App(Box::new(Var("_⁻¹")), Box::new(Var("x"))))
+                Box::new(App(Box::new(Var("_⁻¹")), Explicit, Box::new(Var("x"))))
             )
         );
         Ok(())

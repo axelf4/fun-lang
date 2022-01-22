@@ -1,4 +1,5 @@
 use crate::ast::Term;
+use crate::elaboration::Icitness::*;
 use std::collections::HashMap;
 use std::error;
 use std::fmt;
@@ -49,14 +50,14 @@ pub fn eval<'input, 'env>(env: &'env Env<'input>, e: Term<'input>) -> Result<Val
     Ok(match e {
         Term::Number(n) => Value::Number(n),
         Term::Var(id) => env.lookup(&id).ok_or(Error::UnknownVar)?,
-        Term::App(a, b) => {
+        Term::App(a, _i, b) => {
             if let Value::Lambda(env2, x, e) = eval(env, *a)? {
                 eval(&env2.insert(x, eval(env, *b)?), e)?
             } else {
                 return Err(Error::AppNotFun);
             }
         }
-        Term::Abs(x, e) => Value::Lambda(env.clone(), x, *e),
+        Term::Abs(_i, x, e) => Value::Lambda(env.clone(), x, *e),
 
         _ => todo!(),
     })
@@ -77,7 +78,8 @@ mod tests {
             eval(
                 &Env::new(),
                 Term::App(
-                    Box::new(Term::Abs("x", Box::new(Term::Var("x")))),
+                    Box::new(Term::Abs(Explicit, "x", Box::new(Term::Var("x")))),
+                    Explicit,
                     Box::new(Term::Number(4))
                 )
             )?,

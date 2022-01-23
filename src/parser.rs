@@ -1,25 +1,25 @@
 /// Mixfix operator parser.
-use crate::ast::Term;
+use crate::ast::{prepend_arg, Term};
 use crate::elaboration::Icitness::*;
 use crate::lexer::{self, Spanned, Token};
+use itertools::{intersperse, Itertools as _};
 use lalrpop_util::lalrpop_mod;
-use std::collections::HashSet;
-use std::{error, fmt, iter, slice};
-
-use nom::IResult;
-use nom::Parser as _;
-use nom::{
-    branch::alt,
-    combinator::{all_consuming, verify},
-    multi::{fold_many1, many1},
-    sequence::terminated,
+use petgraph::{
+    graph::{Graph, NodeIndex},
+    Direction,
 };
+use std::collections::HashMap;
+use std::collections::HashSet;
+use std::{error, fmt, iter};
+
+use glr::{lalr, Grammar, Parser, Sppf, SppfNode, Symbol};
 
 lalrpop_mod!(pub fun);
 
 #[derive(Debug)]
 pub enum Error<'input> {
     LalrpopError(lalrpop_util::ParseError<usize, Token<'input>, lexer::Error<'input>>),
+    AmbiguousMixfix,
     MixfixError,
 }
 
@@ -35,6 +35,7 @@ impl<'input> fmt::Display for Error<'input> {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
         match self {
             Error::LalrpopError(e) => e.fmt(fmt),
+            Error::AmbiguousMixfix => write!(fmt, "term is ambiguous due to mixfix operators"),
             Error::MixfixError => write!(
                 fmt,
                 "failed to parse mixfix operator wrt. associativity/precedence"
@@ -48,6 +49,7 @@ impl<'input> error::Error for Error<'input> {}
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Associativity {
     Left,
+    #[allow(unused)]
     Right,
     Non,
 }
@@ -68,8 +70,12 @@ struct Operator<'a>(Fixity, &'a str);
 impl<'a> Operator<'a> {
     fn from_str(assoc: Associativity, s: &'a str) -> Option<Operator<'a>> {
         use Associativity::*;
+        // TODO Make this an error
         if s == "_" || s.contains("__") {
             return None;
+        }
+        if !s.contains('_') {
+            return None; // Not an operator
         }
         Some(match (s.starts_with('_'), assoc, s.ends_with('_')) {
             (true, _, true) => Self(Infix(assoc), s),
@@ -85,55 +91,42 @@ impl<'a> Operator<'a> {
     }
 }
 
+#[derive(Debug)]
 struct Precedence<'input> {
     operators: Vec<Operator<'input>>,
-    sucs: Vec<Precedence<'input>>,
 }
 
 struct PrecedenceGraph<'input> {
-    roots: Vec<Precedence<'input>>,
+    g: Graph<Precedence<'input>, ()>,
     op_parts: HashSet<&'input str>,
+    op_names: HashSet<&'input str>,
 }
 
 impl<'input> PrecedenceGraph<'input> {
-    fn new(roots: Vec<Precedence<'input>>) -> Self {
-        let mut result = Self {
-            roots,
-            op_parts: Default::default(),
-        };
-        result.op_parts = result
-            .nodes()
+    fn new(g: Graph<Precedence<'input>, ()>) -> Self {
+        let op_parts = g
+            .node_weights()
             .flat_map(|p| &p.operators)
             .flat_map(|op| op.name_parts())
             .collect();
-        result
+        let op_names = g
+            .node_weights()
+            .flat_map(|p| &p.operators)
+            .map(|op| op.1)
+            .collect();
+        Self {
+            g,
+            op_parts,
+            op_names,
+        }
     }
 
-    /// Returns an iterator of all nodes in this graph.
-    fn nodes(&self) -> impl Iterator<Item = &Precedence<'input>> {
-        let mut x = vec![self.roots.iter()];
-        iter::from_fn(move || {
-            let item = loop {
-                if let Some(item) = x.last_mut()?.next() {
-                    break item;
-                } else {
-                    x.pop();
-                }
-            };
-            x.push(item.sucs.iter());
-            Some(item)
-        })
-    }
-
-    fn non_op<'a>(
-        &'a self,
-    ) -> impl FnMut(Input<'input, 'a>) -> IResult<Input<'input, 'a>, &'a Term<'input>> {
-        verify(single_expr(), |e| {
-            if let Term::Var(s) = e {
-                !self.op_parts.contains(s)
-            } else {
-                true
-            }
+    fn roots<'a>(&'a self) -> impl Iterator<Item = NodeIndex> + 'a {
+        self.g.node_indices().filter(|&i| {
+            matches!(
+                self.g.neighbors_directed(i, Direction::Incoming).next(),
+                None
+            )
         })
     }
 
@@ -143,207 +136,330 @@ impl<'input> PrecedenceGraph<'input> {
         } else {
             return f(self);
         };
-        self.roots.push(Precedence {
+        let lvl = self.g.add_node(Precedence {
             operators: vec![op],
-            sucs: Vec::new(),
         });
         let existing_parts: Vec<_> = op
             .name_parts()
             .filter(|part| !self.op_parts.insert(part))
             .collect();
+        let new_name = self.op_names.insert(name);
 
         let result = f(self);
 
+        if new_name {
+            self.op_names.remove(name);
+        }
         existing_parts
             .into_iter()
             .for_each(|part| debug_assert!(self.op_parts.remove(part)));
-        self.roots.pop();
+        self.g.remove_node(lvl);
 
         result
     }
 }
 
-#[derive(Clone, Debug)]
-struct Input<'input, 'a>(iter::Rev<slice::Iter<'a, Term<'input>>>);
+struct ParserBuilder<'input, 'a> {
+    pg: &'a PrecedenceGraph<'input>,
+    productions: Vec<Vec<Vec<Symbol>>>,
+    num_nonterminals: usize,
 
-impl<'input, 'a> nom::InputLength for Input<'input, 'a> {
-    fn input_len(&self) -> usize {
-        self.0.size_hint().0
-    }
+    lvl_to_sym: HashMap<NodeIndex, Symbol>,
+    str_to_sym: HashMap<&'input str, Symbol>,
+    str_map: HashMap<Symbol, &'input str>,
 }
 
-/// Returns a parser for a single expression token.
-fn single_expr<'input: 'a, 'a>(
-) -> impl Fn(Input<'input, 'a>) -> IResult<Input<'input, 'a>, &'a Term<'input>> {
-    move |i| {
-        let mut i2 = i.clone();
-        match i2.0.next() {
-            Some(x) => Ok((i2, x)),
-            _ => Err(nom::Err::Error(nom::error::Error {
-                input: i,
-                code: nom::error::ErrorKind::Tag,
-            })),
-        }
-    }
-}
-
-fn alt_iter<I, Input, Output, Error>(iter: I) -> impl FnOnce(Input) -> IResult<Input, Output, Error>
-where
-    Input: Clone,
-    I: Iterator,
-    I::Item: nom::Parser<Input, Output, Error>,
-    Error: nom::error::ParseError<Input>,
-{
-    |i| {
-        let mut e: Option<Error> = None;
-        for mut p in iter {
-            match p.parse(i.clone()) {
-                Err(nom::Err::Error(e2)) => e = Some(if let Some(e1) = e { e1.or(e2) } else { e2 }),
-                res => return res,
+impl<'input: 'a, 'a> ParserBuilder<'input, 'a> {
+    fn new(pg: &'a PrecedenceGraph<'input>) -> Self {
+        let num_nonterminals = /* start */ 1 + /* juxtaposition */ 1 + /* atom */ 1 + pg.g.node_indices().map(|node| {
+            let child_count = pg.g.neighbors(node).count();
+            pg.g[node].operators.len() + match child_count {
+                0 => 1,
+                1 => 1,
+                // Otherwise we create a parent nonterminal for the
+                // combination of successor levels.
+                _ => 2,
             }
+        }).sum::<usize>();
+
+        Self {
+            pg,
+            productions: vec![Vec::new(), Vec::new(), Vec::new()],
+            num_nonterminals,
+
+            lvl_to_sym: HashMap::new(),
+            str_to_sym: HashMap::new(),
+            str_map: HashMap::new(),
         }
-        Err(nom::Err::Error(e.unwrap_or(Error::from_error_kind(
-            i,
-            nom::error::ErrorKind::Alt,
-        ))))
     }
-}
 
-fn expr<'input: 'a, 'a>(
-    prec_graph: &'a PrecedenceGraph<'input>,
-) -> impl Fn(Input<'input, 'a>) -> IResult<Input<'input, 'a>, Term<'input>> {
-    precs(prec_graph, &prec_graph.roots)
-}
+    fn non_op_sym(&self) -> Symbol {
+        self.num_nonterminals as Symbol
+    }
 
-fn precs<'input: 'a, 'a>(
-    prec_graph: &'a PrecedenceGraph<'input>,
-    ps: &'a [Precedence<'input>],
-) -> impl Fn(Input<'input, 'a>) -> IResult<Input<'input, 'a>, Term<'input>> {
-    |i| {
-        let op_closed = |i| {
-            alt_iter(
-                prec_graph
-                    .nodes()
-                    .map(|p| inner_at_fix(prec_graph, p, Closed)),
-            )(i)
-        };
-        let mut atom =
-            many1(alt((prec_graph.non_op().map(Clone::clone), op_closed))).map(|mut xs| {
-                let e = xs.pop().expect("many1 did not parse 1 element?");
-                xs.into_iter()
-                    .rev()
-                    .fold(e, |acc, f| Term::App(Box::new(f), Explicit, Box::new(acc)))
-            });
-        if ps.is_empty() {
-            atom.parse(i)
+    fn build_root(&mut self) {
+        // Only works if there are some ops
+        self.productions[0] = self
+            .pg
+            .roots()
+            .map(|node| vec![self.sym_for_lvl(node)])
+            .collect();
+    }
+
+    fn build_atom(&mut self) {
+        self.productions[1] = vec![vec![1, 2], vec![2]];
+        self.productions[2] = vec![vec![self.num_nonterminals as Symbol]];
+        for op in self
+            .pg
+            .g
+            .node_weights()
+            .flat_map(|p| &p.operators)
+            .filter(|&op| op.0 == Closed)
+        {
+            let prod = intersperse(op.name_parts().map(|s| self.sym_for_str(s)), 0).collect();
+            self.productions[2].push(prod);
+        }
+    }
+
+    fn sym_for_lvl(&mut self, p: NodeIndex) -> Symbol {
+        *self.lvl_to_sym.entry(p).or_insert_with(|| {
+            let sym = self.productions.len() as Symbol;
+            self.productions.push(Vec::new());
+            sym
+        })
+    }
+
+    fn sym_for_str(&mut self, s: &'input str) -> Symbol {
+        let next_sym = self.num_symbols() as Symbol;
+        *self.str_to_sym.entry(s).or_insert_with(|| {
+            self.str_map.insert(next_sym, s);
+            next_sym
+        })
+    }
+
+    fn build_lvl(&mut self, node: NodeIndex) {
+        let p = &self.pg.g[node];
+        let sym = self.sym_for_lvl(node);
+
+        let mut succs = self.pg.g.neighbors(node);
+        // Nonterminal for higher precedence level
+        let p_suc = if let Some(fst) = succs.next() {
+            let p_fst = self.sym_for_lvl(fst);
+
+            if let Some(snd) = succs.next() {
+                let _p_snd = self.sym_for_lvl(snd);
+                todo!()
+            } else {
+                p_fst
+            }
         } else {
-            alt_iter(ps.into_iter().map(|p| prec(prec_graph, p)))(i)
-        }
-    }
-}
+            1 // Atom
+        };
 
-fn inner_at_fix<'input: 'a, 'a>(
-    prec_graph: &'a PrecedenceGraph<'input>,
-    p: &'a Precedence<'input>,
-    fix: Fixity,
-) -> impl Fn(Input<'input, 'a>) -> IResult<Input<'input, 'a>, Term<'input>> {
-    // Match a single specific identifier token
-    let ident = |id| verify(single_expr(), move |&e: &&Term<'input>| e == &Term::Var(id));
-
-    move |i| {
-        let ops = p.operators.iter().filter(move |Operator(f, _)| f == &fix);
-
-        alt_iter(ops.map(|op @ Operator(_, s)| {
-            move |i| {
-                let mut res = Term::Var(s);
-                let mut name_parts = op.name_parts();
-
-                let (mut i, _) = ident(name_parts.next().unwrap())(i)?;
-                while let Some(s) = name_parts.next() {
-                    let (i2, e) = terminated(expr(prec_graph), ident(s))(i)?;
-                    res = Term::App(Box::new(res), Explicit, Box::new(e));
-                    i = i2;
-                }
-
-                Ok((i, res))
-            }
-        }))(i)
-    }
-}
-
-/// Parser for an expression at some precedence level.
-fn prec<'input: 'a, 'a>(
-    prec_graph: &'a PrecedenceGraph<'input>,
-    p: &'a Precedence<'input>,
-) -> impl Fn(Input<'input, 'a>) -> IResult<Input<'input, 'a>, Term<'input>> + 'a {
-    move |i| {
-        let p_suc = precs(prec_graph, &p.sucs); // TODO Memoize
-
-        fn prepend_arg<'input>(f: Term<'input>, e: Term<'input>) -> Term<'input> {
-            match f {
-                Term::App(f, i, e2) => {
-                    Term::App(Box::new(Term::App(f, Explicit, Box::new(e))), Explicit, e2)
-                }
-                _ => Term::App(Box::new(f), Explicit, Box::new(e)),
-            }
+        let mut prods = vec![vec![p_suc]];
+        for op in &p.operators {
+            let inner = intersperse(op.name_parts().map(|s| self.sym_for_str(s)), 0);
+            prods.push(match op.0 {
+                Closed => continue,
+                Prefix => inner.chain(iter::once(sym)).collect(),
+                Infix(Associativity::Left) => iter::once(sym)
+                    .chain(inner)
+                    .chain(iter::once(p_suc))
+                    .collect(),
+                Infix(Associativity::Right) => iter::once(p_suc)
+                    .chain(inner)
+                    .chain(iter::once(sym))
+                    .collect(),
+                Infix(Associativity::Non) => iter::once(p_suc)
+                    .chain(inner)
+                    .chain(iter::once(p_suc))
+                    .collect(),
+                Postfix => iter::once(sym).chain(inner).collect(),
+            });
         }
 
-        let x = alt((
-            |i| {
-                let (i, el) = p_suc(i)?;
-                let (i, f) = inner_at_fix(prec_graph, p, Infix(Associativity::Non))(i)?;
-                let (i, er) = p_suc(i)?;
-                Ok((
-                    i,
-                    Term::App(Box::new(prepend_arg(f, el)), Explicit, Box::new(er)),
-                ))
-            },
-            |i| {
-                let pre_right = alt((inner_at_fix(prec_graph, p, Prefix), |i| {
-                    let (i, e) = p_suc(i)?;
-                    let (i, f) = inner_at_fix(prec_graph, p, Infix(Associativity::Right))(i)?;
-                    Ok((i, prepend_arg(f, e)))
-                }));
+        self.productions[sym as usize] = prods;
+    }
 
-                let (i, fs) = many1(pre_right)(i)?;
-                let (i, e) = p_suc(i)?;
-                Ok((
-                    i,
-                    fs.into_iter()
-                        .rev()
-                        .fold(e, |acc, f| Term::App(Box::new(f), Explicit, Box::new(acc))),
-                ))
-            },
-            |i| {
-                let post_left = alt((
-                    inner_at_fix(prec_graph, p, Postfix).map(|f| (f, None)),
-                    |i| {
-                        let (i, f) = inner_at_fix(prec_graph, p, Infix(Associativity::Left))(i)?;
-                        let (i, er) = p_suc(i)?;
-                        Ok((i, (f, Some(er))))
-                    },
-                ));
+    fn num_symbols(&self) -> usize {
+        self.num_nonterminals + 1 + self.str_to_sym.len()
+    }
 
-                let (i, e) = p_suc(i)?;
-                let mut e = Some(e);
-                let x = fold_many1(
-                    post_left,
-                    || e.take().unwrap(),
-                    |acc, (f, er)| {
-                        let a = prepend_arg(f, acc);
-                        if let Some(e) = er {
-                            Term::App(Box::new(a), Explicit, Box::new(e))
-                        } else {
-                            a
+    fn as_grammar(&self) -> Grammar<'_> {
+        Grammar {
+            num_symbols: self.num_symbols(),
+            nonterminals: &self.productions,
+        }
+    }
+
+    fn rebuild_inner(
+        &self,
+        sppf: &Sppf,
+        nodes: &[SppfNode],
+        input: &mut impl Iterator<Item = Term<'input>>,
+        fix: Fixity,
+    ) -> Result<Term<'input>, Error<'input>> {
+        let s = (if let Infix(_) | Postfix = fix {
+            Some("")
+        } else {
+            None
+        })
+        .into_iter()
+        .chain(
+            nodes
+                .iter()
+                .step_by(2)
+                .map(|n| self.str_map[&n.symbol(sppf).unwrap()]),
+        )
+        .chain(if let Prefix | Infix(_) = fix {
+            Some("")
+        } else {
+            None
+        })
+        .join("_");
+        let f = Term::Var(self.pg.op_names.get(s.as_str()).unwrap());
+        let e = nodes.iter().skip(1).step_by(2).try_fold(f, |e, &n| {
+            input.next().unwrap();
+            Ok::<_, Error<'input>>(Term::App(
+                Box::new(e),
+                Explicit,
+                Box::new(self.rebuild(sppf, n, input)?),
+            ))
+        })?;
+        input.next().unwrap();
+        Ok(e)
+    }
+
+    fn rebuild(
+        &self,
+        sppf: &Sppf,
+        node: SppfNode,
+        input: &mut impl Iterator<Item = Term<'input>>,
+    ) -> Result<Term<'input>, Error<'input>> {
+        let is_op_part = |n: SppfNode| {
+            if let Ok(s) = n.symbol(sppf) {
+                // If s is a terminal and not non_op
+                s > self.num_nonterminals as Symbol
+            } else {
+                false
+            }
+        };
+        let children = {
+            let mut family = node.family(sppf);
+            if let Some(children) = family.next() {
+                if family.next().is_some() {
+                    // TODO This will probably shit itself if the
+                    // graph is not linear.
+                    return Err(Error::AmbiguousMixfix);
+                }
+                children
+            } else {
+                &[]
+            }
+        };
+        match node.symbol(sppf) {
+            // A top-level expression
+            Ok(0) => self.rebuild(sppf, children[0], input),
+            // Juxtaposition
+            Ok(1) => {
+                let e = self.rebuild(sppf, children[0], input)?;
+                Ok(if let Some(&n) = children.get(1) {
+                    Term::App(
+                        Box::new(e),
+                        Explicit,
+                        Box::new(self.rebuild(sppf, n, input)?),
+                    )
+                } else {
+                    e
+                })
+            }
+            // Atom
+            Ok(2) => {
+                // If closed
+                if children.len() == 1 {
+                    self.rebuild(sppf, children[0], input)
+                } else {
+                    self.rebuild_inner(sppf, children, input, Closed)
+                }
+            }
+            // Single term
+            Ok(s) if s == self.non_op_sym() => Ok(input.next().unwrap()),
+            // Otherwise, a precedence level
+            Ok(_) => match children {
+                [] => unreachable!(),
+                [x] => self.rebuild(sppf, *x, input),
+                [fst, mid @ .., lst] => {
+                    let fix = match (is_op_part(*fst), is_op_part(*lst)) {
+                        (false, false) => Infix(Associativity::Non),
+                        (true, false) => Prefix,
+                        (false, true) => Postfix,
+                        (true, true) => Closed,
+                    };
+                    match fix {
+                        Prefix => {
+                            let f = self.rebuild_inner(
+                                sppf,
+                                &children[..children.len() - 1],
+                                input,
+                                fix,
+                            )?;
+                            let b = self.rebuild(sppf, *lst, input)?;
+                            Ok(Term::App(Box::new(f), Explicit, Box::new(b)))
                         }
-                    },
-                )(i);
-                x
+                        Infix(_) => {
+                            let a = self.rebuild(sppf, *fst, input)?;
+                            let f = self.rebuild_inner(sppf, mid, input, fix)?;
+                            let b = self.rebuild(sppf, *lst, input)?;
+                            Ok(Term::App(
+                                Box::new(prepend_arg(f, a)),
+                                Explicit,
+                                Box::new(b),
+                            ))
+                        }
+                        Postfix => {
+                            let a = self.rebuild(sppf, *fst, input)?;
+                            let f = self.rebuild_inner(sppf, &children[1..], input, fix)?;
+                            Ok(prepend_arg(f, a))
+                        }
+                        Closed => unreachable!(),
+                    }
+                }
             },
-            |i| p_suc(i),
-        ))(i);
-        x
+            Err(_) => unreachable!(), // The grammar has no nullable symbols
+        }
     }
+}
+
+fn parse_mixfix<'input: 'a, 'a>(
+    pg: &'a PrecedenceGraph<'input>,
+    mut input: impl Iterator<Item = Term<'input>> + Clone,
+) -> Result<Term<'input>, Error<'input>> {
+    let mut builder = ParserBuilder::new(pg);
+
+    builder.build_root();
+    builder.build_atom();
+
+    for node in pg.g.node_indices() {
+        builder.build_lvl(node);
+    }
+
+    let grammar = builder.as_grammar();
+    let table = lalr::Table::new(&grammar);
+    let parser = Parser::new(&grammar, &table);
+
+    let input_symbols = input.clone().map(|e| match e {
+        Term::Var(s) => {
+            if let Some(&sym) = builder.str_to_sym.get(s) {
+                sym
+            } else {
+                builder.non_op_sym()
+            }
+        }
+        _ => builder.non_op_sym(),
+    });
+    let (sppf, root) = parser.parse(input_symbols).ok_or(Error::MixfixError)?;
+    // Rebuild the tree
+    builder.rebuild(&sppf, root, &mut input)
 }
 
 fn prec_pass<'input, 'a>(
@@ -372,10 +488,7 @@ fn prec_pass<'input, 'a>(
             .map(|e| prec_pass(g, e))
             .collect::<Result<_, _>>()?;
 
-            let (_i, e) =
-                alt_iter(g.roots.iter().map(|p| all_consuming(prec(g, p))))(Input(xs.iter().rev()))
-                    .map_err(|_e| Error::MixfixError)?;
-            e
+            parse_mixfix(g, xs.into_iter().rev())?
         }
         Term::Abs(i, x, t) => {
             let t = g.with_op(x, |g| prec_pass(g, *t))?;
@@ -397,17 +510,18 @@ where
 {
     use Associativity::*;
 
-    let prec_tree = Precedence {
+    let mut g = Graph::new();
+    let lvl0 = g.add_node(Precedence {
         operators: vec![Operator::from_str(Left, "_+_").unwrap()],
-        sucs: vec![Precedence {
-            operators: vec![
-                Operator::from_str(Left, "_*_").unwrap(),
-                Operator::from_str(Non, "[_]_").unwrap(),
-            ],
-            sucs: Vec::new(),
-        }],
-    };
-    let mut prec_graph = PrecedenceGraph::new(vec![prec_tree]);
+    });
+    let lvl1 = g.add_node(Precedence {
+        operators: vec![
+            Operator::from_str(Left, "_*_").unwrap(),
+            Operator::from_str(Non, "[_]_").unwrap(),
+        ],
+    });
+    g.add_edge(lvl0, lvl1, ());
+    let mut prec_graph = PrecedenceGraph::new(g);
 
     let expr = *fun::TermParser::new().parse(input)?;
     prec_pass(&mut prec_graph, expr)
@@ -477,7 +591,6 @@ mod tests {
     fn test_parse_bound_mixfix() -> Result<(), Box<dyn error::Error>> {
         assert_eq!(
             parse(Lexer::new(r"\_⁻¹ -> x ⁻¹"))?,
-            // parse(Lexer::new(r"\_⁻¹ -> [ x ⁻¹ ] 3"))?,
             Abs(
                 Explicit,
                 "_⁻¹",

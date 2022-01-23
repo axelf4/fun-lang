@@ -1,5 +1,5 @@
 /// Raw syntax.
-use crate::elaboration::Icitness;
+use crate::elaboration::Icitness::{self, *};
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Term<'input> {
@@ -15,4 +15,13 @@ pub enum Term<'input> {
     /// `_`.
     #[allow(unused)]
     Hole,
+}
+
+pub fn prepend_arg<'input>(f: Term<'input>, e: Term<'input>) -> Term<'input> {
+    match f {
+        Term::App(f, Explicit, e2) => {
+            Term::App(Box::new(Term::App(f, Explicit, Box::new(e))), Explicit, e2)
+        }
+        _ => Term::App(Box::new(f), Explicit, Box::new(e)),
+    }
 }

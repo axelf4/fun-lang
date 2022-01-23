@@ -10,8 +10,9 @@ lalrpop = "0.19.6"
 
 [dependencies]
 logos = "0.12.0"
-lalrpop-util = { version = "0.19.6", features = ["lexer"] }
-hashbrown = "0.11.2"
+lalrpop-util = { version = "0.19.6" }
 regex = "1"
-nom = "7.1.0"
+petgraph = "0.6.0"
+glr = "0.1.0"
+itertools = "0.10.3"
 take_mut = "0.2.2"

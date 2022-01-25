@@ -11,17 +11,19 @@ extern {
 	enum Token<'input> {
 		"\\" => Token::BackSlash,
 		"->" => Token::Arrow,
-		"(" => Token::LParen,
-		")" => Token::RParen,
+		"(" => Token::Lparen,
+		")" => Token::Rparen,
+		"{" => Token::Lbrace,
+		"}" => Token::Rbrace,
 		"=" => Token::Equals,
 		":" => Token::Colon,
 		"let" => Token::Let,
 		"in" => Token::In,
 		"case" => Token::Case,
 		"of" => Token::Of,
-		"{" => Token::LayoutStart,
+		"@{" => Token::LayoutStart,
 		"," => Token::LayoutSep,
-		"}" => Token::LayoutEnd,
+		"}@" => Token::LayoutEnd,
 		Num => Token::Number(<i32>),
 		Ident => Token::Ident(<&'input str>),
 		"Type" => Token::Type,
@@ -49,9 +51,9 @@ pub Term: Box<Term<'input>> = {
 
 	"(" <x:Ident> ":" <a:Term> ")" "->" <b:Term> => Box::new(Term::Pi(<>)),
 
-	"case" <_x:Term> "of" "{" Comma<Arm> "}" => Box::new(Term::Number(69)),
+	"case" <_x:Term> "of" "@{" Comma<Arm> "}@" => Box::new(Term::Number(69)),
 
-	"let" "{" <bs:Comma<Binding>> "}" "in" <e:Term> => {
+	"let" "@{" <bs:Comma<Binding>> "}@" "in" <e:Term> => {
 		bs.into_iter().rev().fold(e, |acc, (x, _t, v)| Box::new(Term::App(Box::new(Term::Abs(Explicit, x, acc)), Explicit, v)))
 	},
 };
@@ -59,6 +61,7 @@ pub Term: Box<Term<'input>> = {
 Term1: Box<Term<'input>> = {
 	Term2,
 	<a:Term1> <b:Term2> => Box::new(Term::App(a, Explicit, b)),
+	<a:Term1> "{" <b:Term> "}" => Box::new(Term::App(a, Implicit, b)),
 }
 
 Term2: Box<Term<'input>> = {

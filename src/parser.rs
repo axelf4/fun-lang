@@ -1,6 +1,23 @@
-/// Mixfix operator parser.
+/*!
+Mixfix operator parser.
+
+Parsing proceeds in two phases:
+
+1. First, the whole file is parsed using the LALRPOP parser, with
+   function applications - including operators - turned into plain
+   lists of tokens.
+2. Second, for every expression in the result of the previous step, it
+   is determined what mixfix operators are in scope. This is used to
+   construct a context-free grammar corresponding to the precedence
+   graph. This grammar is fed into a GLR parser that produces its own
+   syntax tree. Lastly we convert this syntax tree back into our
+   representation.
+
+Implicit arguments cannot be given to operators without using the long
+form (e.g. _+_ {Type} 1 2).
+*/
 use crate::ast::{prepend_arg, Term};
-use crate::elaboration::Icitness::*;
+use crate::elaboration::Icitness::{self, *};
 use crate::lexer::{self, Spanned, Token};
 use itertools::{intersperse, Itertools as _};
 use lalrpop_util::lalrpop_mod;
@@ -123,10 +140,10 @@ impl<'input> PrecedenceGraph<'input> {
 
     fn roots<'a>(&'a self) -> impl Iterator<Item = NodeIndex> + 'a {
         self.g.node_indices().filter(|&i| {
-            matches!(
-                self.g.neighbors_directed(i, Direction::Incoming).next(),
-                None
-            )
+            self.g
+                .neighbors_directed(i, Direction::Incoming)
+                .next()
+                .is_none()
         })
     }
 
@@ -296,7 +313,7 @@ impl<'input: 'a, 'a> ParserBuilder<'input, 'a> {
         &self,
         sppf: &Sppf,
         nodes: &[SppfNode],
-        input: &mut impl Iterator<Item = Term<'input>>,
+        input: &mut impl Iterator<Item = (Icitness, Term<'input>)>,
         fix: Fixity,
     ) -> Result<Term<'input>, Error<'input>> {
         let s = (if let Infix(_) | Postfix = fix {
@@ -323,7 +340,7 @@ impl<'input: 'a, 'a> ParserBuilder<'input, 'a> {
             Ok::<_, Error<'input>>(Term::App(
                 Box::new(e),
                 Explicit,
-                Box::new(self.rebuild(sppf, n, input)?),
+                Box::new(self.rebuild(sppf, n, input)?.1),
             ))
         })?;
         input.next().unwrap();
@@ -334,8 +351,8 @@ impl<'input: 'a, 'a> ParserBuilder<'input, 'a> {
         &self,
         sppf: &Sppf,
         node: SppfNode,
-        input: &mut impl Iterator<Item = Term<'input>>,
-    ) -> Result<Term<'input>, Error<'input>> {
+        input: &mut impl Iterator<Item = (Icitness, Term<'input>)>,
+    ) -> Result<(Icitness, Term<'input>), Error<'input>> {
         let is_op_part = |n: SppfNode| {
             if let Ok(s) = n.symbol(sppf) {
                 // If s is a terminal and not non_op
@@ -357,21 +374,22 @@ impl<'input: 'a, 'a> ParserBuilder<'input, 'a> {
                 &[]
             }
         };
+        // TODO Make it an error to supply an implicit arg to an op
         match node.symbol(sppf) {
             // A top-level expression
             Ok(0) => self.rebuild(sppf, children[0], input),
             // Juxtaposition
             Ok(1) => {
-                let e = self.rebuild(sppf, children[0], input)?;
-                Ok(if let Some(&n) = children.get(1) {
-                    Term::App(
-                        Box::new(e),
-                        Explicit,
-                        Box::new(self.rebuild(sppf, n, input)?),
-                    )
-                } else {
-                    e
-                })
+                let e = self.rebuild(sppf, children[0], input)?.1;
+                Ok((
+                    Explicit,
+                    if let Some(&n) = children.get(1) {
+                        let (i, e2) = self.rebuild(sppf, n, input)?;
+                        Term::App(Box::new(e), i, Box::new(e2))
+                    } else {
+                        e
+                    },
+                ))
             }
             // Atom
             Ok(2) => {
@@ -380,6 +398,7 @@ impl<'input: 'a, 'a> ParserBuilder<'input, 'a> {
                     self.rebuild(sppf, children[0], input)
                 } else {
                     self.rebuild_inner(sppf, children, input, Closed)
+                        .map(|e| (Explicit, e))
                 }
             }
             // Single term
@@ -395,34 +414,33 @@ impl<'input: 'a, 'a> ParserBuilder<'input, 'a> {
                         (false, true) => Postfix,
                         (true, true) => Closed,
                     };
-                    match fix {
-                        Prefix => {
-                            let f = self.rebuild_inner(
-                                sppf,
-                                &children[..children.len() - 1],
-                                input,
-                                fix,
-                            )?;
-                            let b = self.rebuild(sppf, *lst, input)?;
-                            Ok(Term::App(Box::new(f), Explicit, Box::new(b)))
-                        }
-                        Infix(_) => {
-                            let a = self.rebuild(sppf, *fst, input)?;
-                            let f = self.rebuild_inner(sppf, mid, input, fix)?;
-                            let b = self.rebuild(sppf, *lst, input)?;
-                            Ok(Term::App(
-                                Box::new(prepend_arg(f, a)),
-                                Explicit,
-                                Box::new(b),
-                            ))
-                        }
-                        Postfix => {
-                            let a = self.rebuild(sppf, *fst, input)?;
-                            let f = self.rebuild_inner(sppf, &children[1..], input, fix)?;
-                            Ok(prepend_arg(f, a))
-                        }
-                        Closed => unreachable!(),
-                    }
+                    Ok((
+                        Explicit,
+                        match fix {
+                            Prefix => {
+                                let f = self.rebuild_inner(
+                                    sppf,
+                                    &children[..children.len() - 1],
+                                    input,
+                                    fix,
+                                )?;
+                                let b = self.rebuild(sppf, *lst, input)?.1;
+                                Term::App(Box::new(f), Explicit, Box::new(b))
+                            }
+                            Infix(_) => {
+                                let a = self.rebuild(sppf, *fst, input)?.1;
+                                let f = self.rebuild_inner(sppf, mid, input, fix)?;
+                                let b = self.rebuild(sppf, *lst, input)?.1;
+                                Term::App(Box::new(prepend_arg(f, a)), Explicit, Box::new(b))
+                            }
+                            Postfix => {
+                                let a = self.rebuild(sppf, *fst, input)?.1;
+                                let f = self.rebuild_inner(sppf, &children[1..], input, fix)?;
+                                prepend_arg(f, a)
+                            }
+                            Closed => unreachable!(),
+                        },
+                    ))
                 }
             },
             Err(_) => unreachable!(), // The grammar has no nullable symbols
@@ -432,7 +450,7 @@ impl<'input: 'a, 'a> ParserBuilder<'input, 'a> {
 
 fn parse_mixfix<'input: 'a, 'a>(
     pg: &'a PrecedenceGraph<'input>,
-    mut input: impl Iterator<Item = Term<'input>> + Clone,
+    mut input: impl Iterator<Item = (Icitness, Term<'input>)> + Clone,
 ) -> Result<Term<'input>, Error<'input>> {
     let mut builder = ParserBuilder::new(pg);
 
@@ -444,11 +462,13 @@ fn parse_mixfix<'input: 'a, 'a>(
     }
 
     let grammar = builder.as_grammar();
+    // TODO Cache the parser
     let table = lalr::Table::new(&grammar);
     let parser = Parser::new(&grammar, &table);
 
+    // TODO Do not clone the expressions of the iterator
     let input_symbols = input.clone().map(|e| match e {
-        Term::Var(s) => {
+        (_, Term::Var(s)) => {
             if let Some(&sym) = builder.str_to_sym.get(s) {
                 sym
             } else {
@@ -459,7 +479,7 @@ fn parse_mixfix<'input: 'a, 'a>(
     });
     let (sppf, root) = parser.parse(input_symbols).ok_or(Error::MixfixError)?;
     // Rebuild the tree
-    builder.rebuild(&sppf, root, &mut input)
+    Ok(builder.rebuild(&sppf, root, &mut input)?.1)
 }
 
 fn prec_pass<'input, 'a>(
@@ -468,24 +488,22 @@ fn prec_pass<'input, 'a>(
 ) -> Result<Term<'input>, Error<'input>> {
     Ok(match e {
         Term::Number(_) | Term::Var(_) | Term::Type | Term::Hole => e,
-        Term::App(_, i, _) => {
-            assert!(i == Explicit);
+        Term::App(_, _, _) => {
             // Unfold the left-recursive sequence
             let mut e = Some(e);
             let xs: Vec<_> = iter::from_fn(move || {
                 Some(match e.take()? {
                     Term::App(next, i, item) => {
-                        assert!(i == Explicit); // TODO
                         e = Some(*next);
-                        *item
+                        (i, *item)
                     }
                     item => {
                         e = None;
-                        item
+                        (Explicit, item)
                     }
                 })
             })
-            .map(|e| prec_pass(g, e))
+            .map(|(i, e)| prec_pass(g, e).map(|e| (i, e)))
             .collect::<Result<_, _>>()?;
 
             parse_mixfix(g, xs.into_iter().rev())?
@@ -595,6 +613,23 @@ mod tests {
                 Explicit,
                 "_⁻¹",
                 Box::new(App(Box::new(Var("_⁻¹")), Explicit, Box::new(Var("x"))))
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_implicit_arg() -> Result<(), Box<dyn error::Error>> {
+        assert_eq!(
+            parse(Lexer::new(r"0 + id {Type} Type"))?,
+            App(
+                Box::new(App(Box::new(Var("_+_")), Explicit, Box::new(Number(0)))),
+                Explicit,
+                Box::new(App(
+                    Box::new(App(Box::new(Var("id")), Implicit, Box::new(Type))),
+                    Explicit,
+                    Box::new(Type)
+                ))
             )
         );
         Ok(())

@@ -7,7 +7,7 @@ use std::ops::Range;
 pub enum Token<'input> {
     #[regex("-?[0-9]+", |lex| lex.slice().parse(), priority = 2)]
     Number(i32),
-    #[regex(r#"[^\p{Pattern_White_Space}\p{gc=Private_Use}\p{gc=Control}\p{Noncharacter_Code_Point}()\\.:@"]+"#)]
+    #[regex(r#"[^\p{Pattern_White_Space}\p{gc=Private_Use}\p{gc=Control}\p{Noncharacter_Code_Point}()\\.:{}@"]+"#)]
     Ident(&'input str),
 
     #[token(r"\")]
@@ -15,9 +15,13 @@ pub enum Token<'input> {
     #[token("->")]
     Arrow,
     #[token("(")]
-    LParen,
+    Lparen,
     #[token(")")]
-    RParen,
+    Rparen,
+    #[token("{")]
+    Lbrace,
+    #[token("}")]
+    Rbrace,
     #[token("=")]
     Equals,
     #[token(":")]
@@ -53,8 +57,10 @@ impl<'input> fmt::Display for Token<'input> {
             Ident(s) => s.fmt(fmt),
             BackSlash => write!(fmt, "\\"),
             Arrow => write!(fmt, "->"),
-            LParen => write!(fmt, "("),
-            RParen => write!(fmt, ")"),
+            Lparen => write!(fmt, "("),
+            Rparen => write!(fmt, ")"),
+            Lbrace => write!(fmt, "{{"),
+            Rbrace => write!(fmt, "}}"),
             Equals => write!(fmt, "="),
             Colon => write!(fmt, ":"),
             Type => write!(fmt, "Type"),
@@ -62,9 +68,9 @@ impl<'input> fmt::Display for Token<'input> {
             Of => write!(fmt, "of"),
             Let => write!(fmt, "let"),
             In => write!(fmt, "in"),
-            LayoutStart => write!(fmt, "{{"),
+            LayoutStart => write!(fmt, "@{{"),
             LayoutSep => write!(fmt, ","),
-            LayoutEnd => write!(fmt, "}}"),
+            LayoutEnd => write!(fmt, "}}@"),
             Error => write!(fmt, "error"),
         }
     }
@@ -84,6 +90,7 @@ pub type Spanned<Tok, Loc, Error> = Result<(Loc, Tok, Loc), Error>;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Delimiter {
     Paren,
+    Brace,
     LetIn,
     CaseOf,
 }
@@ -210,15 +217,26 @@ impl<'input> Iterator for Lexer<'input> {
 
         let mut should_insert_default = false;
         match token {
-            Token::LParen => {
+            Token::Lparen => {
                 self.stack.push(State::Delimiter(Delimiter::Paren));
                 self.collapse(is_offside);
                 should_insert_default = true;
             }
-            Token::RParen => {
+            Token::Rparen => {
                 // self.collapse(until_delim(Delimiter::Paren));
                 self.collapse(State::is_implicit);
                 if self.stack.last() == Some(&State::Delimiter(Delimiter::Paren)) {
+                    self.stack.pop();
+                }
+            }
+            Token::Lbrace => {
+                self.stack.push(State::Delimiter(Delimiter::Brace));
+                self.collapse(is_offside);
+                should_insert_default = true;
+            }
+            Token::Rbrace => {
+                self.collapse(State::is_implicit);
+                if self.stack.last() == Some(&State::Delimiter(Delimiter::Brace)) {
                     self.stack.pop();
                 }
             }
@@ -314,13 +332,13 @@ mod tests {
         assert_eq!(
             Lexer::new("(case 0 of) x -> x").collect::<Result<_, _>>(),
             Ok(vec![
-                (0, LParen, 1),
+                (0, Lparen, 1),
                 (1, Case, 5),
                 (6, Number(0), 7),
                 (8, Of, 10),
                 (10, LayoutStart, 10),
                 (10, LayoutEnd, 10),
-                (10, RParen, 11),
+                (10, Rparen, 11),
                 (12, Ident("x"), 13),
                 (14, Arrow, 16),
                 (17, Ident("x"), 18),

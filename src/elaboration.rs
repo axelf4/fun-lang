@@ -200,8 +200,8 @@ impl fmt::Display for Error {
 
 impl error::Error for Error {}
 
-// /// Pair of unforced type and forced type.
-// struct Gty(Value, Value);
+// /// Pair of unforced value and forced value.
+// struct Glued(Value, Value);
 
 #[derive(Clone, Debug)]
 enum SymbolValue {
@@ -376,6 +376,7 @@ impl<'input> Ctx<'input> {
     }
 
     /// The normalization function.
+    #[allow(unused)]
     fn nf(&mut self, t: Term) -> Term {
         let v = t.eval(&self.meta_ctx, &self.env);
         self.quote(self.lvl(), v)

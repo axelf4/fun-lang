@@ -38,6 +38,7 @@ pub enum Error<'input> {
     LalrpopError(lalrpop_util::ParseError<usize, Token<'input>, lexer::Error<'input>>),
     AmbiguousMixfix,
     MixfixError,
+    EmptyNamePart(&'input str),
 }
 
 impl<'input> From<lalrpop_util::ParseError<usize, Token<'input>, lexer::Error<'input>>>
@@ -50,12 +51,18 @@ impl<'input> From<lalrpop_util::ParseError<usize, Token<'input>, lexer::Error<'i
 
 impl<'input> fmt::Display for Error<'input> {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        use Error::*;
         match self {
-            Error::LalrpopError(e) => e.fmt(fmt),
-            Error::AmbiguousMixfix => write!(fmt, "term is ambiguous due to mixfix operators"),
-            Error::MixfixError => write!(
+            LalrpopError(e) => e.fmt(fmt),
+            AmbiguousMixfix => write!(fmt, "term is ambiguous due to mixfix operators"),
+            MixfixError => write!(
                 fmt,
                 "failed to parse mixfix operator wrt. associativity/precedence"
+            ),
+            EmptyNamePart(s) => write!(
+                fmt,
+                "the operator ‘{}’ contains empty name parts that are not suffixes/prefixes",
+                s
             ),
         }
     }
@@ -85,22 +92,21 @@ use Fixity::*;
 struct Operator<'a>(Fixity, &'a str);
 
 impl<'a> Operator<'a> {
-    fn from_str(assoc: Associativity, s: &'a str) -> Option<Operator<'a>> {
+    fn from_str(assoc: Associativity, s: &'a str) -> Result<Option<Operator<'a>>, Error<'a>> {
         use Associativity::*;
-        // TODO Make this an error
         if s == "_" || s.contains("__") {
-            return None;
+            return Err(Error::EmptyNamePart(s));
         }
         if !s.contains('_') {
-            return None; // Not an operator
+            return Ok(None); // Not an operator
         }
-        Some(match (s.starts_with('_'), assoc, s.ends_with('_')) {
+        Ok(Some(match (s.starts_with('_'), assoc, s.ends_with('_')) {
             (true, _, true) => Self(Infix(assoc), s),
             (false, Non, true) => Self(Prefix, s),
             (true, Non, false) => Self(Postfix, s),
             (false, Non, false) => Self(Closed, s),
-            _ => return None,
-        })
+            _ => unreachable!("Non infix ops may not be associative"),
+        }))
     }
 
     fn name_parts(&self) -> impl Iterator<Item = &'a str> {
@@ -147,11 +153,15 @@ impl<'input> PrecedenceGraph<'input> {
         })
     }
 
-    fn with_op<R>(&mut self, name: &'input str, f: impl FnOnce(&mut Self) -> R) -> R {
-        let op = if let Some(op) = Operator::from_str(Associativity::Non, name) {
+    fn with_op<R>(
+        &mut self,
+        name: &'input str,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> Result<R, Error<'input>> {
+        let op = if let Some(op) = Operator::from_str(Associativity::Non, name)? {
             op
         } else {
-            return f(self);
+            return Ok(f(self));
         };
         let lvl = self.g.add_node(Precedence {
             operators: vec![op],
@@ -172,11 +182,11 @@ impl<'input> PrecedenceGraph<'input> {
             .for_each(|part| debug_assert!(self.op_parts.remove(part)));
         self.g.remove_node(lvl);
 
-        result
+        Ok(result)
     }
 }
 
-struct ParserBuilder<'input, 'a> {
+struct MixfixParser<'input, 'a> {
     pg: &'a PrecedenceGraph<'input>,
     productions: Vec<Vec<Vec<Symbol>>>,
     num_nonterminals: usize,
@@ -186,7 +196,11 @@ struct ParserBuilder<'input, 'a> {
     str_map: HashMap<Symbol, &'input str>,
 }
 
-impl<'input: 'a, 'a> ParserBuilder<'input, 'a> {
+const SYM_ROOT: Symbol = 0;
+const SYM_JUXTAPOS: Symbol = 1;
+const SYM_ATOM: Symbol = 2;
+
+impl<'input: 'a, 'a> MixfixParser<'input, 'a> {
     fn new(pg: &'a PrecedenceGraph<'input>) -> Self {
         let num_nonterminals = /* start */ 1 + /* juxtaposition */ 1 + /* atom */ 1 + pg.g.node_indices().map(|node| {
             let child_count = pg.g.neighbors(node).count();
@@ -199,43 +213,25 @@ impl<'input: 'a, 'a> ParserBuilder<'input, 'a> {
             }
         }).sum::<usize>();
 
-        Self {
+        let mut result = Self {
             pg,
-            productions: vec![Vec::new(), Vec::new(), Vec::new()],
+            productions: Vec::with_capacity(num_nonterminals),
             num_nonterminals,
 
             lvl_to_sym: HashMap::new(),
             str_to_sym: HashMap::new(),
             str_map: HashMap::new(),
-        }
+        };
+        result.build();
+        result
     }
 
     fn non_op_sym(&self) -> Symbol {
         self.num_nonterminals as Symbol
     }
 
-    fn build_root(&mut self) {
-        // Only works if there are some ops
-        self.productions[0] = self
-            .pg
-            .roots()
-            .map(|node| vec![self.sym_for_lvl(node)])
-            .collect();
-    }
-
-    fn build_atom(&mut self) {
-        self.productions[1] = vec![vec![1, 2], vec![2]];
-        self.productions[2] = vec![vec![self.num_nonterminals as Symbol]];
-        for op in self
-            .pg
-            .g
-            .node_weights()
-            .flat_map(|p| &p.operators)
-            .filter(|&op| op.0 == Closed)
-        {
-            let prod = intersperse(op.name_parts().map(|s| self.sym_for_str(s)), 0).collect();
-            self.productions[2].push(prod);
-        }
+    fn num_symbols(&self) -> usize {
+        self.num_nonterminals + 1 + self.str_to_sym.len()
     }
 
     fn sym_for_lvl(&mut self, p: NodeIndex) -> Symbol {
@@ -254,6 +250,44 @@ impl<'input: 'a, 'a> ParserBuilder<'input, 'a> {
         })
     }
 
+    fn build(&mut self) {
+        // Reserve symbols for root/juxtaposition/atom
+        for _ in 0..3 {
+            self.productions.push(Vec::new());
+        }
+
+        // Build the root
+        self.productions[SYM_ROOT as usize] = self
+            .pg
+            .roots()
+            .map(|node| vec![self.sym_for_lvl(node)])
+            .collect();
+        assert!(
+            self.productions[SYM_ROOT as usize].len() > 0,
+            "Some operator is required."
+        );
+
+        // Build atom
+        self.productions[SYM_JUXTAPOS as usize] =
+            vec![vec![SYM_JUXTAPOS, SYM_ATOM], vec![SYM_ATOM]];
+        self.productions[SYM_ATOM as usize] = iter::once(vec![self.non_op_sym()])
+            .chain(
+                self.pg
+                    .g
+                    .node_weights()
+                    .flat_map(|p| &p.operators)
+                    .filter(|&op| op.0 == Closed)
+                    .map(|op| {
+                        intersperse(op.name_parts().map(|s| self.sym_for_str(s)), 0).collect()
+                    }),
+            )
+            .collect();
+
+        for node in self.pg.g.node_indices() {
+            self.build_lvl(node);
+        }
+    }
+
     fn build_lvl(&mut self, node: NodeIndex) {
         let p = &self.pg.g[node];
         let sym = self.sym_for_lvl(node);
@@ -270,7 +304,7 @@ impl<'input: 'a, 'a> ParserBuilder<'input, 'a> {
                 p_fst
             }
         } else {
-            1 // Atom
+            SYM_JUXTAPOS
         };
 
         let mut prods = vec![vec![p_suc]];
@@ -298,11 +332,7 @@ impl<'input: 'a, 'a> ParserBuilder<'input, 'a> {
         self.productions[sym as usize] = prods;
     }
 
-    fn num_symbols(&self) -> usize {
-        self.num_nonterminals + 1 + self.str_to_sym.len()
-    }
-
-    fn as_grammar(&self) -> Grammar<'_> {
+    fn as_grammar(&self) -> Grammar {
         Grammar {
             num_symbols: self.num_symbols(),
             nonterminals: &self.productions,
@@ -376,10 +406,8 @@ impl<'input: 'a, 'a> ParserBuilder<'input, 'a> {
         };
         // TODO Make it an error to supply an implicit arg to an op
         match node.symbol(sppf) {
-            // A top-level expression
-            Ok(0) => self.rebuild(sppf, children[0], input),
-            // Juxtaposition
-            Ok(1) => {
+            Ok(SYM_ROOT) => self.rebuild(sppf, children[0], input),
+            Ok(SYM_JUXTAPOS) => {
                 let e = self.rebuild(sppf, children[0], input)?.1;
                 Ok((
                     Explicit,
@@ -391,8 +419,7 @@ impl<'input: 'a, 'a> ParserBuilder<'input, 'a> {
                     },
                 ))
             }
-            // Atom
-            Ok(2) => {
+            Ok(SYM_ATOM) => {
                 // If closed
                 if children.len() == 1 {
                     self.rebuild(sppf, children[0], input)
@@ -452,34 +479,26 @@ fn parse_mixfix<'input: 'a, 'a>(
     pg: &'a PrecedenceGraph<'input>,
     mut input: impl Iterator<Item = (Icitness, Term<'input>)> + Clone,
 ) -> Result<Term<'input>, Error<'input>> {
-    let mut builder = ParserBuilder::new(pg);
-
-    builder.build_root();
-    builder.build_atom();
-
-    for node in pg.g.node_indices() {
-        builder.build_lvl(node);
-    }
-
-    let grammar = builder.as_grammar();
-    // TODO Cache the parser
+    let mixfix_parser = MixfixParser::new(pg);
+    let grammar = mixfix_parser.as_grammar();
+    // TODO Cache the parse table
     let table = lalr::Table::new(&grammar);
     let parser = Parser::new(&grammar, &table);
 
     // TODO Do not clone the expressions of the iterator
     let input_symbols = input.clone().map(|e| match e {
         (_, Term::Var(s)) => {
-            if let Some(&sym) = builder.str_to_sym.get(s) {
+            if let Some(&sym) = mixfix_parser.str_to_sym.get(s) {
                 sym
             } else {
-                builder.non_op_sym()
+                mixfix_parser.non_op_sym()
             }
         }
-        _ => builder.non_op_sym(),
+        _ => mixfix_parser.non_op_sym(),
     });
     let (sppf, root) = parser.parse(input_symbols).ok_or(Error::MixfixError)?;
     // Rebuild the tree
-    Ok(builder.rebuild(&sppf, root, &mut input)?.1)
+    Ok(mixfix_parser.rebuild(&sppf, root, &mut input)?.1)
 }
 
 fn prec_pass<'input, 'a>(
@@ -509,13 +528,13 @@ fn prec_pass<'input, 'a>(
             parse_mixfix(g, xs.into_iter().rev())?
         }
         Term::Abs(i, x, t) => {
-            let t = g.with_op(x, |g| prec_pass(g, *t))?;
+            let t = g.with_op(x, |g| prec_pass(g, *t))??;
             Term::Abs(i, x, Box::new(t))
         }
 
         Term::Pi(x, a, b) => {
             let a = prec_pass(g, *a)?;
-            let b = g.with_op(x, |g| prec_pass(g, *b))?;
+            let b = g.with_op(x, |g| prec_pass(g, *b))??;
             Term::Pi(x, Box::new(a), Box::new(b))
         }
     })
@@ -530,12 +549,12 @@ where
 
     let mut g = Graph::new();
     let lvl0 = g.add_node(Precedence {
-        operators: vec![Operator::from_str(Left, "_+_").unwrap()],
+        operators: vec![Operator::from_str(Left, "_+_").unwrap().unwrap()],
     });
     let lvl1 = g.add_node(Precedence {
         operators: vec![
-            Operator::from_str(Left, "_*_").unwrap(),
-            Operator::from_str(Non, "[_]_").unwrap(),
+            Operator::from_str(Left, "_*_").unwrap().unwrap(),
+            Operator::from_str(Non, "[_]_").unwrap().unwrap(),
         ],
     });
     g.add_edge(lvl0, lvl1, ());

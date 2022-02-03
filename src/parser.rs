@@ -25,11 +25,13 @@ use petgraph::{
     graph::{Graph, NodeIndex},
     Direction,
 };
+use self_cell::self_cell;
+use std::cell::{RefCell, RefMut};
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::{error, fmt, iter};
 
-use glr::{lalr, Grammar, Parser, Sppf, SppfNode, Symbol};
+use glr::{lalr, Sppf, SppfNode, Symbol};
 
 lalrpop_mod!(pub fun);
 
@@ -123,6 +125,28 @@ struct PrecedenceGraph<'input> {
     g: Graph<Precedence<'input>, ()>,
     op_parts: HashSet<&'input str>,
     op_names: HashSet<&'input str>,
+    /// Lazily computed mixfix parser.
+    parser: RefCell<Option<MixfixParser<'input>>>,
+}
+
+struct Roots<'a, N, E>(&'a Graph<N, E>, petgraph::graph::NodeIndices);
+
+impl<'a, N, E> Iterator for Roots<'a, N, E> {
+    type Item = NodeIndex;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let n = self.1.next()?;
+            if self
+                .0
+                .neighbors_directed(n, Direction::Incoming)
+                .next()
+                .is_none()
+            {
+                return Some(n);
+            }
+        }
+    }
 }
 
 impl<'input> PrecedenceGraph<'input> {
@@ -141,15 +165,17 @@ impl<'input> PrecedenceGraph<'input> {
             g,
             op_parts,
             op_names,
+            parser: RefCell::new(None),
         }
     }
 
-    fn roots<'a>(&'a self) -> impl Iterator<Item = NodeIndex> + 'a {
-        self.g.node_indices().filter(|&i| {
-            self.g
-                .neighbors_directed(i, Direction::Incoming)
-                .next()
-                .is_none()
+    fn roots(&self) -> impl Iterator<Item = NodeIndex> + '_ {
+        Roots(&self.g, self.g.node_indices())
+    }
+
+    fn parser(&self) -> RefMut<'_, MixfixParser<'input>> {
+        RefMut::map(self.parser.borrow_mut(), |x| {
+            x.get_or_insert_with(|| MixfixParser::from_prec_graph(self))
         })
     }
 
@@ -171,9 +197,11 @@ impl<'input> PrecedenceGraph<'input> {
             .filter(|part| !self.op_parts.insert(part))
             .collect();
         let new_name = self.op_names.insert(name);
+        let old_parser = self.parser.replace(None);
 
         let result = f(self);
 
+        *self.parser.borrow_mut() = old_parser;
         if new_name {
             self.op_names.remove(name);
         }
@@ -186,8 +214,7 @@ impl<'input> PrecedenceGraph<'input> {
     }
 }
 
-struct MixfixParser<'input, 'a> {
-    pg: &'a PrecedenceGraph<'input>,
+struct MixfixBuilder<'input> {
     productions: Vec<Vec<Vec<Symbol>>>,
     num_nonterminals: usize,
 
@@ -200,8 +227,8 @@ const SYM_ROOT: Symbol = 0;
 const SYM_JUXTAPOS: Symbol = 1;
 const SYM_ATOM: Symbol = 2;
 
-impl<'input: 'a, 'a> MixfixParser<'input, 'a> {
-    fn new(pg: &'a PrecedenceGraph<'input>) -> Self {
+impl<'input> MixfixBuilder<'input> {
+    fn new<'a>(pg: &'a PrecedenceGraph<'input>) -> Self {
         let num_nonterminals = /* start */ 1 + /* juxtaposition */ 1 + /* atom */ 1 + pg.g.node_indices().map(|node| {
             let child_count = pg.g.neighbors(node).count();
             pg.g[node].operators.len() + match child_count {
@@ -214,7 +241,6 @@ impl<'input: 'a, 'a> MixfixParser<'input, 'a> {
         }).sum::<usize>();
 
         let mut result = Self {
-            pg,
             productions: Vec::with_capacity(num_nonterminals),
             num_nonterminals,
 
@@ -222,7 +248,7 @@ impl<'input: 'a, 'a> MixfixParser<'input, 'a> {
             str_to_sym: HashMap::new(),
             str_map: HashMap::new(),
         };
-        result.build();
+        result.build(pg);
         result
     }
 
@@ -250,20 +276,26 @@ impl<'input: 'a, 'a> MixfixParser<'input, 'a> {
         })
     }
 
-    fn build(&mut self) {
+    fn as_grammar(&self) -> glr::Grammar {
+        glr::Grammar {
+            num_symbols: self.num_symbols(),
+            nonterminals: &self.productions,
+        }
+    }
+
+    fn build<'a>(&mut self, pg: &'a PrecedenceGraph<'input>) {
         // Reserve symbols for root/juxtaposition/atom
         for _ in 0..3 {
             self.productions.push(Vec::new());
         }
 
         // Build the root
-        self.productions[SYM_ROOT as usize] = self
-            .pg
+        self.productions[SYM_ROOT as usize] = pg
             .roots()
             .map(|node| vec![self.sym_for_lvl(node)])
             .collect();
         assert!(
-            self.productions[SYM_ROOT as usize].len() > 0,
+            !self.productions[SYM_ROOT as usize].is_empty(),
             "Some operator is required."
         );
 
@@ -272,9 +304,7 @@ impl<'input: 'a, 'a> MixfixParser<'input, 'a> {
             vec![vec![SYM_JUXTAPOS, SYM_ATOM], vec![SYM_ATOM]];
         self.productions[SYM_ATOM as usize] = iter::once(vec![self.non_op_sym()])
             .chain(
-                self.pg
-                    .g
-                    .node_weights()
+                pg.g.node_weights()
                     .flat_map(|p| &p.operators)
                     .filter(|&op| op.0 == Closed)
                     .map(|op| {
@@ -283,16 +313,16 @@ impl<'input: 'a, 'a> MixfixParser<'input, 'a> {
             )
             .collect();
 
-        for node in self.pg.g.node_indices() {
-            self.build_lvl(node);
+        for node in pg.g.node_indices() {
+            self.build_lvl(pg, node);
         }
     }
 
-    fn build_lvl(&mut self, node: NodeIndex) {
-        let p = &self.pg.g[node];
+    fn build_lvl<'a>(&mut self, pg: &'a PrecedenceGraph<'input>, node: NodeIndex) {
+        let p = &pg.g[node];
         let sym = self.sym_for_lvl(node);
 
-        let mut succs = self.pg.g.neighbors(node);
+        let mut succs = pg.g.neighbors(node);
         // Nonterminal for higher precedence level
         let p_suc = if let Some(fst) = succs.next() {
             let p_fst = self.sym_for_lvl(fst);
@@ -332,15 +362,9 @@ impl<'input: 'a, 'a> MixfixParser<'input, 'a> {
         self.productions[sym as usize] = prods;
     }
 
-    fn as_grammar(&self) -> Grammar {
-        Grammar {
-            num_symbols: self.num_symbols(),
-            nonterminals: &self.productions,
-        }
-    }
-
-    fn rebuild_inner(
+    fn rebuild_inner<'a>(
         &self,
+        pg: &'a PrecedenceGraph<'input>,
         sppf: &Sppf,
         nodes: &[SppfNode],
         input: &mut impl Iterator<Item = (Icitness, Term<'input>)>,
@@ -364,21 +388,22 @@ impl<'input: 'a, 'a> MixfixParser<'input, 'a> {
             None
         })
         .join("_");
-        let f = Term::Var(self.pg.op_names.get(s.as_str()).unwrap());
+        let f = Term::Var(pg.op_names.get(s.as_str()).unwrap());
         let e = nodes.iter().skip(1).step_by(2).try_fold(f, |e, &n| {
             input.next().unwrap();
             Ok::<_, Error<'input>>(Term::App(
                 Box::new(e),
                 Explicit,
-                Box::new(self.rebuild(sppf, n, input)?.1),
+                Box::new(self.rebuild(pg, sppf, n, input)?.1),
             ))
         })?;
         input.next().unwrap();
         Ok(e)
     }
 
-    fn rebuild(
+    fn rebuild<'a>(
         &self,
+        pg: &'a PrecedenceGraph<'input>,
         sppf: &Sppf,
         node: SppfNode,
         input: &mut impl Iterator<Item = (Icitness, Term<'input>)>,
@@ -406,13 +431,13 @@ impl<'input: 'a, 'a> MixfixParser<'input, 'a> {
         };
         // TODO Make it an error to supply an implicit arg to an op
         match node.symbol(sppf) {
-            Ok(SYM_ROOT) => self.rebuild(sppf, children[0], input),
+            Ok(SYM_ROOT) => self.rebuild(pg, sppf, children[0], input),
             Ok(SYM_JUXTAPOS) => {
-                let e = self.rebuild(sppf, children[0], input)?.1;
+                let e = self.rebuild(pg, sppf, children[0], input)?.1;
                 Ok((
                     Explicit,
                     if let Some(&n) = children.get(1) {
-                        let (i, e2) = self.rebuild(sppf, n, input)?;
+                        let (i, e2) = self.rebuild(pg, sppf, n, input)?;
                         Term::App(Box::new(e), i, Box::new(e2))
                     } else {
                         e
@@ -422,9 +447,9 @@ impl<'input: 'a, 'a> MixfixParser<'input, 'a> {
             Ok(SYM_ATOM) => {
                 // If closed
                 if children.len() == 1 {
-                    self.rebuild(sppf, children[0], input)
+                    self.rebuild(pg, sppf, children[0], input)
                 } else {
-                    self.rebuild_inner(sppf, children, input, Closed)
+                    self.rebuild_inner(pg, sppf, children, input, Closed)
                         .map(|e| (Explicit, e))
                 }
             }
@@ -433,7 +458,7 @@ impl<'input: 'a, 'a> MixfixParser<'input, 'a> {
             // Otherwise, a precedence level
             Ok(_) => match children {
                 [] => unreachable!(),
-                [x] => self.rebuild(sppf, *x, input),
+                [x] => self.rebuild(pg, sppf, *x, input),
                 [fst, mid @ .., lst] => {
                     let fix = match (is_op_part(*fst), is_op_part(*lst)) {
                         (false, false) => Infix(Associativity::Non),
@@ -446,23 +471,24 @@ impl<'input: 'a, 'a> MixfixParser<'input, 'a> {
                         match fix {
                             Prefix => {
                                 let f = self.rebuild_inner(
+                                    pg,
                                     sppf,
                                     &children[..children.len() - 1],
                                     input,
                                     fix,
                                 )?;
-                                let b = self.rebuild(sppf, *lst, input)?.1;
+                                let b = self.rebuild(pg, sppf, *lst, input)?.1;
                                 Term::App(Box::new(f), Explicit, Box::new(b))
                             }
                             Infix(_) => {
-                                let a = self.rebuild(sppf, *fst, input)?.1;
-                                let f = self.rebuild_inner(sppf, mid, input, fix)?;
-                                let b = self.rebuild(sppf, *lst, input)?.1;
+                                let a = self.rebuild(pg, sppf, *fst, input)?.1;
+                                let f = self.rebuild_inner(pg, sppf, mid, input, fix)?;
+                                let b = self.rebuild(pg, sppf, *lst, input)?.1;
                                 Term::App(Box::new(prepend_arg(f, a)), Explicit, Box::new(b))
                             }
                             Postfix => {
-                                let a = self.rebuild(sppf, *fst, input)?.1;
-                                let f = self.rebuild_inner(sppf, &children[1..], input, fix)?;
+                                let a = self.rebuild(pg, sppf, *fst, input)?.1;
+                                let f = self.rebuild_inner(pg, sppf, &children[1..], input, fix)?;
                                 prepend_arg(f, a)
                             }
                             Closed => unreachable!(),
@@ -475,34 +501,61 @@ impl<'input: 'a, 'a> MixfixParser<'input, 'a> {
     }
 }
 
-fn parse_mixfix<'input: 'a, 'a>(
-    pg: &'a PrecedenceGraph<'input>,
-    mut input: impl Iterator<Item = (Icitness, Term<'input>)> + Clone,
-) -> Result<Term<'input>, Error<'input>> {
-    let mixfix_parser = MixfixParser::new(pg);
-    let grammar = mixfix_parser.as_grammar();
-    // TODO Cache the parse table
-    let table = lalr::Table::new(&grammar);
-    let parser = Parser::new(&grammar, &table);
+type GlrGrammar<'grammar> = glr::Grammar<'grammar>;
+type LalrTable<'grammar> = lalr::Table<'grammar>;
 
-    // TODO Do not clone the expressions of the iterator
-    let input_symbols = input.clone().map(|e| match e {
-        (_, Term::Var(s)) => {
-            if let Some(&sym) = mixfix_parser.str_to_sym.get(s) {
-                sym
-            } else {
-                mixfix_parser.non_op_sym()
+self_cell!(
+    struct MixfixGrammar<'input> {
+        owner: MixfixBuilder<'input>,
+        #[covariant]
+        dependent: GlrGrammar,
+    }
+);
+
+self_cell!(
+    struct MixfixParser<'input> {
+        owner: MixfixGrammar<'input>,
+        #[covariant]
+        dependent: LalrTable,
+    }
+);
+
+impl<'input> MixfixParser<'input> {
+    fn from_prec_graph(pg: &PrecedenceGraph<'input>) -> Self {
+        let builder = MixfixBuilder::new(pg);
+        let mixfix_grammar = MixfixGrammar::new(builder, |builder| builder.as_grammar());
+        Self::new(mixfix_grammar, |g| lalr::Table::new(g.borrow_dependent()))
+    }
+
+    fn parse(
+        &self,
+        pg: &PrecedenceGraph<'input>,
+        mut input: impl Iterator<Item = (Icitness, Term<'input>)> + Clone,
+    ) -> Result<Term<'input>, Error<'input>> {
+        let builder = self.borrow_owner().borrow_owner();
+        let grammar = builder.as_grammar();
+        let table = self.borrow_dependent();
+        let parser = glr::Parser::new(&grammar, table);
+
+        // TODO Do not clone the expressions of the iterator
+        let input_symbols = input.clone().map(|e| match e {
+            (_, Term::Var(s)) => {
+                if let Some(&sym) = builder.str_to_sym.get(s) {
+                    sym
+                } else {
+                    builder.non_op_sym()
+                }
             }
-        }
-        _ => mixfix_parser.non_op_sym(),
-    });
-    let (sppf, root) = parser.parse(input_symbols).ok_or(Error::MixfixError)?;
-    // Rebuild the tree
-    Ok(mixfix_parser.rebuild(&sppf, root, &mut input)?.1)
+            _ => builder.non_op_sym(),
+        });
+        let (sppf, root) = parser.parse(input_symbols).ok_or(Error::MixfixError)?;
+        // Rebuild the tree
+        Ok(builder.rebuild(pg, &sppf, root, &mut input)?.1)
+    }
 }
 
 fn prec_pass<'input, 'a>(
-    g: &'a mut PrecedenceGraph<'input>,
+    pg: &'a mut PrecedenceGraph<'input>,
     e: Term<'input>,
 ) -> Result<Term<'input>, Error<'input>> {
     Ok(match e {
@@ -522,19 +575,19 @@ fn prec_pass<'input, 'a>(
                     }
                 })
             })
-            .map(|(i, e)| prec_pass(g, e).map(|e| (i, e)))
+            .map(|(i, e)| prec_pass(pg, e).map(|e| (i, e)))
             .collect::<Result<_, _>>()?;
 
-            parse_mixfix(g, xs.into_iter().rev())?
+            pg.parser().parse(pg, xs.into_iter().rev())?
         }
         Term::Abs(i, x, t) => {
-            let t = g.with_op(x, |g| prec_pass(g, *t))??;
+            let t = pg.with_op(x, |g| prec_pass(g, *t))??;
             Term::Abs(i, x, Box::new(t))
         }
 
         Term::Pi(x, a, b) => {
-            let a = prec_pass(g, *a)?;
-            let b = g.with_op(x, |g| prec_pass(g, *b))??;
+            let a = prec_pass(pg, *a)?;
+            let b = pg.with_op(x, |g| prec_pass(g, *b))??;
             Term::Pi(x, Box::new(a), Box::new(b))
         }
     })

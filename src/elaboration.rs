@@ -1,20 +1,15 @@
 /// Takes raw syntax and outputs core syntax.
-use crate::ast as raw;
 use std::collections::HashMap;
 use std::error;
 use std::fmt;
 use std::ops;
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Icitness {
-    Explicit,
-    Implicit,
-}
-use Icitness::*;
+use crate::ast as raw;
+use crate::core::{
+    Icitness::{self, *},
+    Ix, MetaVar, Term, Type,
+};
 
-/// De Bruijn index.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub struct Ix(usize);
 /// De Bruijn level.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 struct Lvl(usize);
@@ -28,30 +23,6 @@ impl Lvl {
         Self(self.0 + 1)
     }
 }
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Bd {
-    Bound,
-    #[allow(unused)]
-    Defined,
-}
-
-/// Core term.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub enum Term {
-    /// A local variable.
-    LocalVar(Ix),
-    App(Box<Term>, Icitness, Box<Term>),
-    Abs(Icitness, Box<Term>),
-    /// The universe.
-    Type,
-    Pi(Icitness, Box<Type>, Box<Type>),
-    Meta(MetaVar),
-    /// Representation of a hole plugged with a meta.
-    InsertedMeta(MetaVar, Vec<Bd>),
-}
-
-type Type = Term;
 
 #[derive(Clone, Default, Debug)]
 struct Env(Vec<Value>);
@@ -95,15 +66,15 @@ impl Term {
 #[derive(Clone, Debug)]
 struct Spine(Vec<(Value, Icitness)>);
 
-impl FromIterator<(Value, Icitness)> for Spine {
-    fn from_iter<I: IntoIterator<Item = (Value, Icitness)>>(iter: I) -> Self {
-        Self(iter.into_iter().collect())
-    }
-}
-
 impl Spine {
     fn new() -> Self {
         Self(Vec::new())
+    }
+}
+
+impl FromIterator<(Value, Icitness)> for Spine {
+    fn from_iter<I: IntoIterator<Item = (Value, Icitness)>>(iter: I) -> Self {
+        Self(iter.into_iter().collect())
     }
 }
 
@@ -130,8 +101,7 @@ enum Value {
     Rigid(Lvl, Spine),
     /// Flexible neutral value.
     ///
-    /// This is a meta applied to zero or more arguments. "Flexible"
-    /// because computation can progress if the meta is solved.
+    /// This is a meta applied to zero or more arguments.
     Flex(MetaVar, Spine),
 
     Abs(Icitness, Closure),
@@ -167,11 +137,12 @@ impl Value {
     }
 
     /// We apply a value to a mask of entries from the environment.
-    fn apply_bds(self, meta_ctx: &MetaCtx, env: &Env, bds: &[Bd]) -> Value {
-        env.0.iter().zip(bds).fold(self, |acc, x| match x {
-            (t, Bd::Bound) => acc.apply(meta_ctx, Explicit, t.clone()),
-            (_t, Bd::Defined) => acc,
-        })
+    fn apply_bds(self, meta_ctx: &MetaCtx, env: &Env, bds: &[bool]) -> Value {
+        env.0
+            .iter()
+            .zip(bds)
+            .filter(|(_, &x)| x)
+            .fold(self, |acc, (t, _)| acc.apply(meta_ctx, Explicit, t.clone()))
     }
 }
 
@@ -207,15 +178,6 @@ impl error::Error for Error {}
 enum SymbolValue {
     // Top,
     Local(Lvl, Vtype),
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
-pub struct MetaVar(usize);
-
-impl fmt::Display for MetaVar {
-    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
-        write!(fmt, "?{}", self.0)
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -303,7 +265,8 @@ struct Ctx<'input> {
 
     /// Local evaluation environment.
     env: Env,
-    bds: Vec<Bd>,
+    /// Mask of what entries in the local context metas abstract over.
+    bds: Vec<bool>,
 
     /// Symbol table.
     table: HashMap<&'input str, SymbolValue>,
@@ -403,30 +366,23 @@ impl<'input> Ctx<'input> {
 
     /// Perform the renaming on rhs, while checking for `m` occurrences.
     fn rename(&self, m: MetaVar, renaming: &PartialRenaming, v: Value) -> Result<Term, Error> {
+        let go_spine = |t, spine: Spine| {
+            spine.0.into_iter().try_fold(t, |t, (u, i)| {
+                Ok(Term::App(
+                    Box::new(t),
+                    i,
+                    Box::new(self.rename(m, renaming, u)?),
+                ))
+            })
+        };
+
         Ok(match self.force(v) {
             Value::Flex(m2, _) if m == m2 => return Err(Error::UnificationFailure),
-            Value::Flex(m2, spine) => {
-                spine.0.into_iter().try_fold(Term::Meta(m2), |t, (u, i)| {
-                    Ok(Term::App(
-                        Box::new(t),
-                        i,
-                        Box::new(self.rename(m, renaming, u)?),
-                    ))
-                })?
-            }
+            Value::Flex(m2, spine) => go_spine(Term::Meta(m2), spine)?,
 
             Value::Rigid(x, spine) => {
                 let x2 = *renaming.map.get(&x).ok_or(Error::UnificationFailure)?;
-                spine.0.into_iter().try_fold(
-                    Term::LocalVar(x2.to_ix(Lvl(renaming.dom))),
-                    |t, (u, i)| {
-                        Ok(Term::App(
-                            Box::new(t),
-                            i,
-                            Box::new(self.rename(m, renaming, u)?),
-                        ))
-                    },
-                )?
+                go_spine(Term::LocalVar(x2.to_ix(Lvl(renaming.dom))), spine)?
             }
 
             Value::Abs(i, t) => Term::Abs(
@@ -519,17 +475,11 @@ impl<'input> Ctx<'input> {
     }
 
     /// Run the function in this context extended with a bound
-    /// variable/definition.
-    fn with<R>(
-        &mut self,
-        x: &'input str,
-        a: Vtype,
-        bd: Bd,
-        f: impl FnOnce(&mut Ctx<'input>) -> R,
-    ) -> R {
+    /// variable/definition (TODO).
+    fn with<R>(&mut self, x: &'input str, a: Vtype, f: impl FnOnce(&mut Ctx<'input>) -> R) -> R {
         let l = self.lvl();
         self.env.0.push(Value::Rigid(l, Spine::new()));
-        self.bds.push(bd);
+        self.bds.push(true);
         let old_sym = self.table.insert(x, SymbolValue::Local(l, a));
 
         let result = f(self);
@@ -578,13 +528,12 @@ impl<'input> Ctx<'input> {
             raw::Term::Abs(i, x, t) => {
                 let i = *i;
                 let a = self.fresh_meta().eval(&self.meta_ctx, &self.env);
-                let (t, b) =
-                    match self.with(x, a.clone(), Bd::Bound, |ctx| ctx.infer(t.as_ref()))? {
-                        x @ (Type::Abs(Implicit, _), _) => x,
-                        // Insert fresh implicit applications to a term
-                        // which is not an implicit lambda (i.e. neutral).
-                        (t, b) => self.insert_implicits(t, b),
-                    };
+                let (t, b) = match self.with(x, a.clone(), |ctx| ctx.infer(t.as_ref()))? {
+                    x @ (Type::Abs(Implicit, _), _) => x,
+                    // Insert fresh implicit applications to a term
+                    // which is not an implicit lambda (i.e. neutral).
+                    (t, b) => self.insert_implicits(t, b),
+                };
                 (
                     Term::Abs(i, Box::new(t)),
                     Value::Pi(i, Box::new(a), self.close_value(b)),
@@ -605,7 +554,7 @@ impl<'input> Ctx<'input> {
                         let a = self.fresh_meta().eval(&self.meta_ctx, &self.env);
                         let b = Closure(
                             self.env.clone(),
-                            self.with("x", a.clone(), Bd::Bound, |ctx| ctx.fresh_meta()),
+                            self.with("x", a.clone(), |ctx| ctx.fresh_meta()),
                         );
                         self.unify(
                             self.lvl(),
@@ -624,7 +573,7 @@ impl<'input> Ctx<'input> {
 
             raw::Term::Pi(x, a, b) => {
                 let a = self.check(a.as_ref(), Value::Type)?;
-                let b = self.with(x, a.eval(&self.meta_ctx, &self.env), Bd::Bound, |ctx| {
+                let b = self.with(x, a.eval(&self.meta_ctx, &self.env), |ctx| {
                     ctx.check(b.as_ref(), Value::Type)
                 })?;
                 (Term::Pi(Explicit, Box::new(a), Box::new(b)), Value::Type)
@@ -646,7 +595,7 @@ impl<'input> Ctx<'input> {
                 let l = self.lvl();
                 Term::Abs(
                     i,
-                    Box::new(self.with(x, *a, Bd::Bound, |ctx| {
+                    Box::new(self.with(x, *a, |ctx| {
                         let x = ctx.check(
                             t.as_ref(),
                             b.apply(&ctx.meta_ctx, Value::Rigid(l, Spine::new())),

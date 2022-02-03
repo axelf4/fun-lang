@@ -1,6 +1,6 @@
 use crate::lexer::{self, Token};
 use crate::ast::{Term};
-use crate::elaboration::Icitness::*;
+use crate::core::Icitness::*;
 
 grammar<'input>;
 

@@ -1,5 +1,5 @@
 use crate::ast::Term;
-use crate::elaboration::Icitness::*;
+use crate::core::Icitness::*;
 use std::collections::HashMap;
 use std::error;
 use std::fmt;

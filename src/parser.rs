@@ -17,7 +17,7 @@ Implicit arguments cannot be given to operators without using the long
 form (e.g. _+_ {Type} 1 2).
 */
 use crate::ast::{prepend_arg, Term};
-use crate::elaboration::Icitness::{self, *};
+use crate::core::Icitness::{self, *};
 use crate::lexer::{self, Spanned, Token};
 use itertools::{intersperse, Itertools as _};
 use lalrpop_util::lalrpop_mod;

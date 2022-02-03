@@ -1,5 +1,5 @@
 /// Raw syntax.
-use crate::elaboration::Icitness::{self, *};
+use crate::core::Icitness::{self, *};
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Term<'input> {

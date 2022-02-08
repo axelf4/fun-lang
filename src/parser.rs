@@ -194,7 +194,7 @@ impl<'input> PrecedenceGraph<'input> {
         });
         let existing_parts: Vec<_> = op
             .name_parts()
-            .filter(|part| !self.op_parts.insert(part))
+            .filter(|&part| !self.op_parts.insert(part))
             .collect();
         let new_name = self.op_names.insert(name);
         let old_parser = self.parser.replace(None);
@@ -232,8 +232,7 @@ impl<'input> MixfixBuilder<'input> {
         let num_nonterminals = /* start */ 1 + /* juxtaposition */ 1 + /* atom */ 1 + pg.g.node_indices().map(|node| {
             let child_count = pg.g.neighbors(node).count();
             pg.g[node].operators.len() + match child_count {
-                0 => 1,
-                1 => 1,
+                0 | 1 => 1,
                 // Otherwise we create a parent nonterminal for the
                 // combination of successor levels.
                 _ => 2,

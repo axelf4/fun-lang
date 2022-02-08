@@ -58,6 +58,44 @@ impl Term {
             Term::InsertedMeta(m, bds) => meta_ctx.meta_value(*m).apply_bds(meta_ctx, env, bds),
         }
     }
+
+    /// Replace meta-variables with their solutions.
+    fn zonk(&mut self, meta_ctx: &MetaCtx, env: &mut Env, l: Lvl) -> Result<(), Error> {
+        Ok(match self {
+            Term::LocalVar(_) | Term::Type => (),
+            Term::Abs(_, t) => {
+                env.0.push(Value::Rigid(l, Spine::new()));
+                t.zonk(meta_ctx, env, l.inc())?;
+                env.0.pop();
+            }
+            Term::App(a, _, b) => {
+                a.zonk(meta_ctx, env, l)?;
+                b.zonk(meta_ctx, env, l)?;
+            }
+            Term::Pi(_, a, b) => {
+                a.zonk(meta_ctx, env, l)?;
+                env.0.push(Value::Rigid(l, Spine::new()));
+                b.zonk(meta_ctx, env, l.inc())?;
+                env.0.pop();
+            }
+            Term::Meta(m) => {
+                if let MetaEntry::Solved(v) = &meta_ctx[*m] {
+                    *self = v.clone().quote(meta_ctx, l);
+                    self.zonk(meta_ctx, env, l)?;
+                } else {
+                    return Err(Error::UnsolvedMeta);
+                }
+            }
+            Term::InsertedMeta(m, bds) => {
+                if let MetaEntry::Solved(v) = &meta_ctx[*m] {
+                    *self = v.clone().apply_bds(meta_ctx, env, bds).quote(meta_ctx, l);
+                    self.zonk(meta_ctx, env, l)?;
+                } else {
+                    return Err(Error::UnsolvedMeta);
+                }
+            }
+        })
+    }
 }
 
 /// A list of values.
@@ -144,6 +182,48 @@ impl Value {
             .filter(|(_, &x)| x)
             .fold(self, |acc, (t, _)| acc.apply(meta_ctx, Explicit, t.clone()))
     }
+
+    fn force(self, meta_ctx: &MetaCtx) -> Self {
+        match self {
+            Value::Flex(m, spine) => {
+                if let MetaEntry::Solved(v) = &meta_ctx[m] {
+                    v.clone().apply_spine(meta_ctx, spine).force(meta_ctx)
+                } else {
+                    Value::Flex(m, spine)
+                }
+            }
+            v => v,
+        }
+    }
+
+    fn quote(self, meta_ctx: &MetaCtx, l: Lvl) -> Term {
+        let quote_spine = |t: Term, spine: Spine| {
+            spine.0.into_iter().fold(t, |acc, (v, i)| {
+                Term::App(Box::new(acc), i, Box::new(v.quote(meta_ctx, l)))
+            })
+        };
+
+        match self.force(meta_ctx) {
+            Value::Rigid(x, spine) => quote_spine(Term::LocalVar(x.to_ix(l)), spine),
+            Value::Flex(m, spine) => quote_spine(Term::Meta(m), spine),
+            Value::Abs(i, t) => Term::Abs(
+                i,
+                Box::new(
+                    t.apply(meta_ctx, Value::Rigid(l, Spine::new()))
+                        .quote(meta_ctx, l.inc()),
+                ),
+            ),
+            Value::Pi(i, a, b) => Term::Pi(
+                i,
+                Box::new(a.quote(meta_ctx, l)),
+                Box::new(
+                    b.apply(meta_ctx, Value::Rigid(l, Spine::new()))
+                        .quote(meta_ctx, l.inc()),
+                ),
+            ),
+            Value::Type => Term::Type,
+        }
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -152,6 +232,7 @@ pub enum Error {
     NotInScope(String),
     UnificationFailure,
     IcitnessMismatch,
+    UnsolvedMeta,
 }
 
 impl fmt::Display for Error {
@@ -164,6 +245,7 @@ impl fmt::Display for Error {
                 fmt,
                 "found explicit/implicit argument when the other was expected"
             ),
+            UnsolvedMeta => write!(fmt, "unsolved meta"),
             x => write!(fmt, "Type error: {:?}", x),
         }
     }
@@ -289,67 +371,23 @@ impl<'input> Ctx<'input> {
 
     fn fresh_meta(&mut self) -> Term {
         let meta_var = self.meta_ctx.fresh();
-        let t = Term::InsertedMeta(meta_var, self.bds.clone());
         // Contextual metavariables means creating a function that
         // abstracts over the bound variables in scope.
-        t
-    }
-
-    fn force(&self, v: Value) -> Value {
-        match v {
-            Value::Flex(m, spine) => {
-                if let MetaEntry::Solved(v) = &self.meta_ctx[m] {
-                    let v = v.clone();
-                    self.force(v.apply_spine(&self.meta_ctx, spine))
-                } else {
-                    Value::Flex(m, spine)
-                }
-            }
-            v => v,
-        }
-    }
-
-    fn quote_spine(&self, l: Lvl, t: Term, spine: Spine) -> Term {
-        spine.0.into_iter().fold(t, |acc, (v, i)| {
-            Term::App(Box::new(acc), i, Box::new(self.quote(l, v)))
-        })
-    }
-
-    fn quote(&self, l: Lvl, v: Value) -> Term {
-        match self.force(v) {
-            Value::Flex(m, spine) => self.quote_spine(l, Term::Meta(m), spine),
-            Value::Rigid(x, spine) => self.quote_spine(l, Term::LocalVar(x.to_ix(l)), spine),
-            Value::Abs(i, t) => Term::Abs(
-                i,
-                Box::new(self.quote(
-                    l.inc(),
-                    t.apply(&self.meta_ctx, Value::Rigid(l, Spine::new())),
-                )),
-            ),
-            Value::Pi(i, a, b) => Term::Pi(
-                i,
-                Box::new(self.quote(l, *a)),
-                Box::new(self.quote(
-                    l.inc(),
-                    b.apply(&self.meta_ctx, Value::Rigid(l, Spine::new())),
-                )),
-            ),
-            Value::Type => Term::Type,
-        }
+        Term::InsertedMeta(meta_var, self.bds.clone())
     }
 
     /// The normalization function.
     #[allow(unused)]
     fn nf(&mut self, t: Term) -> Term {
         let v = t.eval(&self.meta_ctx, &self.env);
-        self.quote(self.lvl(), v)
+        v.quote(&self.meta_ctx, self.lvl())
     }
 
     fn invert(&self, gamma: Lvl, spine: Spine) -> Option<PartialRenaming> {
         let dom = spine.0.len();
         let renaming = spine.0.into_iter().enumerate().try_fold(
             HashMap::new(),
-            |mut renaming, (y, (v, _))| match self.force(v) {
+            |mut renaming, (y, (v, _))| match v.force(&self.meta_ctx) {
                 Value::Rigid(x, spine) if spine.0.is_empty() => {
                     renaming.insert(x, Lvl(y));
                     Some(renaming)
@@ -376,7 +414,7 @@ impl<'input> Ctx<'input> {
             })
         };
 
-        Ok(match self.force(v) {
+        Ok(match v.force(&self.meta_ctx) {
             Value::Flex(m2, _) if m == m2 => return Err(Error::UnificationFailure),
             Value::Flex(m2, spine) => go_spine(Term::Meta(m2), spine)?,
 
@@ -440,7 +478,7 @@ impl<'input> Ctx<'input> {
     }
 
     fn unify(&mut self, l: Lvl, v1: Value, v2: Value) -> Result<(), Error> {
-        let x = match (self.force(v1), self.force(v2)) {
+        match (v1.force(&self.meta_ctx), v2.force(&self.meta_ctx)) {
             (Value::Abs(_, t1), Value::Abs(_, t2)) => self.unify(
                 l.inc(),
                 t1.apply(&self.meta_ctx, Value::Rigid(l, Spine::new())),
@@ -470,8 +508,7 @@ impl<'input> Ctx<'input> {
 
             (Value::Flex(m, sp), v) | (v, Value::Flex(m, sp)) => self.solve(l, m, sp, v),
             _ => Err(Error::UnificationFailure), // rigid mismatch error
-        };
-        x
+        }
     }
 
     /// Run the function in this context extended with a bound
@@ -496,13 +533,13 @@ impl<'input> Ctx<'input> {
     }
 
     fn close_value(&mut self, v: Value) -> Closure {
-        Closure(self.env.clone(), self.quote(self.lvl().inc(), v))
+        Closure(self.env.clone(), v.quote(&self.meta_ctx, self.lvl().inc()))
     }
 
     /// Insert fresh implicit applications.
     fn insert_implicits(&mut self, mut t: Term, mut va: Vtype) -> (Term, Vtype) {
         loop {
-            match self.force(va) {
+            match va.force(&self.meta_ctx) {
                 Value::Pi(Implicit, _a, b) => {
                     let m = self.fresh_meta();
                     t = Term::App(Box::new(t), Implicit, Box::new(m.clone()));
@@ -547,7 +584,7 @@ impl<'input> Ctx<'input> {
                     (Explicit, (t, tty)) => self.insert_implicits(t, tty),
                 };
                 // Ensure that tty is Pi
-                let (a, b) = match self.force(tty) {
+                let (a, b) = match tty.force(&self.meta_ctx) {
                     Value::Pi(i2, _a, _b) if i != i2 => return Err(Error::IcitnessMismatch),
                     Value::Pi(_i2, a, b) => (*a, b),
                     tty => {
@@ -590,7 +627,7 @@ impl<'input> Ctx<'input> {
     }
 
     fn check(&mut self, t: &raw::Term<'input>, a: Vtype) -> Result<Term, Error> {
-        Ok(match (t, self.force(a)) {
+        Ok(match (t, a.force(&self.meta_ctx)) {
             (raw::Term::Abs(i2, x, t), Value::Pi(i, a, b)) if i == *i2 => {
                 let l = self.lvl();
                 Term::Abs(
@@ -618,8 +655,9 @@ impl<'input> Ctx<'input> {
 
 pub fn elaborate<'input>(t: &raw::Term<'input>) -> Result<(Term, Term), Error> {
     let mut ctx = Ctx::new();
-    let (t, vty) = ctx.infer(t)?;
-    Ok((t, ctx.quote(ctx.lvl(), vty)))
+    let (mut t, vty) = ctx.infer(t)?;
+    t.zonk(&ctx.meta_ctx, &mut Env::new(), Lvl(0))?;
+    Ok((t, vty.quote(&ctx.meta_ctx, ctx.lvl())))
 }
 
 mod tests {

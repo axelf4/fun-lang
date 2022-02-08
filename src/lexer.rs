@@ -201,6 +201,7 @@ impl<'input> Iterator for Lexer<'input> {
 
         let column = self.column;
         let is_offside = |state: &State| match state {
+            State::LayoutStart(layout_col) if newline && column <= *layout_col => true,
             State::Layout(layout_col) if newline && column < *layout_col => true,
             _ => false,
         };

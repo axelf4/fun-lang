@@ -18,9 +18,9 @@ pub enum Error {
 
 impl fmt::Display for Error {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            &Error::UnknownVar => write!(fmt, "unknown var"),
-            &Error::AppNotFun => write!(fmt, "applied non-function value"),
+        match *self {
+            Error::UnknownVar => write!(fmt, "unknown var"),
+            Error::AppNotFun => write!(fmt, "applied non-function value"),
         }
     }
 }
@@ -49,7 +49,7 @@ impl<'input> Env<'input> {
 pub fn eval<'input, 'env>(env: &'env Env<'input>, e: Term<'input>) -> Result<Value<'input>, Error> {
     Ok(match e {
         Term::Number(n) => Value::Number(n),
-        Term::Var(id) => env.lookup(&id).ok_or(Error::UnknownVar)?,
+        Term::Var(id) => env.lookup(id).ok_or(Error::UnknownVar)?,
         Term::App(a, _i, b) => {
             if let Value::Lambda(env2, x, e) = eval(env, *a)? {
                 eval(&env2.insert(x, eval(env, *b)?), e)?
@@ -61,6 +61,10 @@ pub fn eval<'input, 'env>(env: &'env Env<'input>, e: Term<'input>) -> Result<Val
 
         _ => todo!(),
     })
+}
+
+pub fn interpret<'input>(e: Term<'input>) -> Result<Value<'input>, Error> {
+    eval(&Env::new(), e)
 }
 
 mod tests {

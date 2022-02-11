@@ -594,7 +594,6 @@ fn prec_pass<'input, 'a>(
 
 pub fn parse<'input, I>(input: I) -> Result<Term<'input>, Error<'input>>
 where
-    I: 'input,
     I: Iterator<Item = Spanned<Token<'input>, usize, lexer::Error<'input>>>,
 {
     use Associativity::*;
@@ -619,7 +618,6 @@ where
 mod tests {
     use super::*;
     use crate::lexer::Lexer;
-    use std::error;
     use Term::*;
 
     #[test]

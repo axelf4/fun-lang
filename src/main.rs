@@ -3,7 +3,6 @@ use std::fs;
 mod ast;
 mod core;
 mod elaboration;
-mod interpreter;
 mod lexer;
 mod parser;
 

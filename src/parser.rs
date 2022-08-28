@@ -33,7 +33,7 @@ use std::{error, fmt, iter};
 
 use glr::{lalr, Sppf, SppfNode, Symbol};
 
-lalrpop_mod!(pub fun);
+lalrpop_mod!(#[allow(clippy::all)] pub fun);
 
 #[derive(Debug)]
 pub enum Error<'input> {
@@ -61,11 +61,7 @@ impl<'input> fmt::Display for Error<'input> {
                 fmt,
                 "failed to parse mixfix operator wrt. associativity/precedence"
             ),
-            EmptyNamePart(s) => write!(
-                fmt,
-                "the operator ‘{}’ contains empty name parts that are not suffixes/prefixes",
-                s
-            ),
+            EmptyNamePart(s) => write!(fmt, "the operator ‘{}’ contains empty name parts", s),
         }
     }
 }
@@ -123,7 +119,6 @@ struct Precedence<'input> {
 
 struct PrecedenceGraph<'input> {
     g: Graph<Precedence<'input>, ()>,
-    op_parts: HashSet<&'input str>,
     op_names: HashSet<&'input str>,
     /// Lazily computed mixfix parser.
     parser: RefCell<Option<MixfixParser<'input>>>,
@@ -151,11 +146,6 @@ impl<'a, N, E> Iterator for Roots<'a, N, E> {
 
 impl<'input> PrecedenceGraph<'input> {
     fn new(g: Graph<Precedence<'input>, ()>) -> Self {
-        let op_parts = g
-            .node_weights()
-            .flat_map(|p| &p.operators)
-            .flat_map(|op| op.name_parts())
-            .collect();
         let op_names = g
             .node_weights()
             .flat_map(|p| &p.operators)
@@ -163,7 +153,6 @@ impl<'input> PrecedenceGraph<'input> {
             .collect();
         Self {
             g,
-            op_parts,
             op_names,
             parser: RefCell::new(None),
         }
@@ -192,10 +181,6 @@ impl<'input> PrecedenceGraph<'input> {
         let lvl = self.g.add_node(Precedence {
             operators: vec![op],
         });
-        let existing_parts: Vec<_> = op
-            .name_parts()
-            .filter(|&part| !self.op_parts.insert(part))
-            .collect();
         let new_name = self.op_names.insert(name);
         let old_parser = self.parser.replace(None);
 
@@ -205,9 +190,6 @@ impl<'input> PrecedenceGraph<'input> {
         if new_name {
             self.op_names.remove(name);
         }
-        existing_parts
-            .into_iter()
-            .for_each(|part| debug_assert!(self.op_parts.remove(part)));
         self.g.remove_node(lvl);
 
         Ok(result)
@@ -615,6 +597,7 @@ where
     prec_pass(&mut prec_graph, expr)
 }
 
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::lexer::Lexer;

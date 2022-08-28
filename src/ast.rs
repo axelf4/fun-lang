@@ -10,7 +10,6 @@ pub enum Term<'input> {
     Var(&'input str),
     App(Box<Term<'input>>, Icitness, Box<Term<'input>>),
     Abs(Icitness, &'input str, Box<Term<'input>>),
-    /// The dependent function type (`(x : A) -> B`).
     Pi(&'input str, Box<Term<'input>>, Box<Term<'input>>),
     /// `_`.
     #[allow(unused)]

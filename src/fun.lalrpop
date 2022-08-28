@@ -1,8 +1,8 @@
+grammar<'input>;
+
 use crate::lexer::{self, Token};
 use crate::ast::{Term};
 use crate::core::Icitness::*;
-
-grammar<'input>;
 
 extern {
 	type Location = usize;

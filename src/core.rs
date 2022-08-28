@@ -9,18 +9,20 @@ pub enum Icitness {
 
 /// De Bruijn index.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub struct Ix(pub usize);
+pub struct Idx(pub usize);
 
 /// Core term.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Term {
     /// A local variable.
-    LocalVar(Ix),
+    LocalVar(Idx),
     App(Box<Term>, Icitness, Box<Term>),
     Abs(Icitness, Box<Term>),
     /// The universe.
     Type,
+    /// The dependent function type (`(x : A) -> B`).
     Pi(Icitness, Box<Type>, Box<Type>),
+
     Meta(MetaVar),
     /// Representation of a hole plugged with a meta.
     InsertedMeta(MetaVar, Vec<bool>),

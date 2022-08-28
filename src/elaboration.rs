@@ -7,7 +7,7 @@ use std::ops;
 use crate::ast as raw;
 use crate::core::{
     Icitness::{self, *},
-    Ix, MetaVar, Term, Type,
+    Idx, MetaVar, Term, Type,
 };
 
 /// De Bruijn level.
@@ -15,8 +15,8 @@ use crate::core::{
 struct Lvl(usize);
 
 impl Lvl {
-    fn to_ix(self, Lvl(count): Lvl) -> Ix {
-        Ix(count - 1 - self.0)
+    fn to_idx(self, Lvl(count): Lvl) -> Idx {
+        Idx(count - 1 - self.0)
     }
 
     fn inc(self) -> Self {
@@ -33,9 +33,9 @@ impl Env {
     }
 }
 
-impl ops::Index<Ix> for Env {
+impl ops::Index<Idx> for Env {
     type Output = Value;
-    fn index(&self, index: Ix) -> &Self::Output {
+    fn index(&self, index: Idx) -> &Self::Output {
         &self.0[self.0.len() - 1 - index.0]
     }
 }
@@ -61,7 +61,7 @@ impl Term {
 
     /// Replace meta-variables with their solutions.
     fn zonk(&mut self, meta_ctx: &MetaCtx, env: &mut Env, l: Lvl) -> Result<(), Error> {
-        Ok(match self {
+        match self {
             Term::LocalVar(_) | Term::Type => (),
             Term::Abs(_, t) => {
                 env.0.push(Value::Rigid(l, Spine::new()));
@@ -94,7 +94,8 @@ impl Term {
                     return Err(Error::UnsolvedMeta);
                 }
             }
-        })
+        }
+        Ok(())
     }
 }
 
@@ -129,7 +130,7 @@ impl Closure {
 
 /// Semantic value.
 ///
-/// Computation can block on metas or variables, giving neutral
+/// Computation can be blocked on metas or arguments, giving neutral
 /// values.
 #[derive(Clone, Debug)]
 enum Value {
@@ -204,7 +205,7 @@ impl Value {
         };
 
         match self.force(meta_ctx) {
-            Value::Rigid(x, spine) => quote_spine(Term::LocalVar(x.to_ix(l)), spine),
+            Value::Rigid(x, spine) => quote_spine(Term::LocalVar(x.to_idx(l)), spine),
             Value::Flex(m, spine) => quote_spine(Term::Meta(m), spine),
             Value::Abs(i, t) => Term::Abs(
                 i,
@@ -413,7 +414,7 @@ impl<'input> Ctx<'input> {
 
             Value::Rigid(x, spine) => {
                 let x2 = *renaming.map.get(&x).ok_or(Error::UnificationFailure)?;
-                go_spine(Term::LocalVar(x2.to_ix(Lvl(renaming.dom))), spine)?
+                go_spine(Term::LocalVar(x2.to_idx(Lvl(renaming.dom))), spine)?
             }
 
             Value::Abs(i, t) => Term::Abs(
@@ -449,11 +450,12 @@ impl<'input> Ctx<'input> {
     ///
     ///    ?α spine =? rhs
     fn solve(&mut self, gamma: Lvl, m: MetaVar, spine: Spine, rhs: Value) -> Result<(), Error> {
-        let is: Vec<_> = spine.0.iter().map(|(_, i)| *i).collect();
-        let renaming = self.invert(gamma, spine).ok_or(Error::UnificationFailure)?;
+        let is = spine.0.iter().map(|(_, i)| *i);
+        let renaming = self
+            .invert(gamma, spine.clone())
+            .ok_or(Error::UnificationFailure)?;
         let rhs = self.rename(m, &renaming, rhs)?;
         let solution = is
-            .into_iter()
             .rev()
             .fold(rhs, |t, i| Term::Abs(i, Box::new(t)))
             .eval(&self.meta_ctx, &Env::new());
@@ -551,7 +553,7 @@ impl<'input> Ctx<'input> {
                     .get(x)
                     .ok_or_else(|| Error::NotInScope(x.to_string()))?
                 {
-                    SymbolValue::Local(x, a) => (Term::LocalVar(x.to_ix(self.lvl())), a.clone()),
+                    SymbolValue::Local(x, a) => (Term::LocalVar(x.to_idx(self.lvl())), a.clone()),
                 }
             }
 
@@ -653,6 +655,7 @@ pub fn elaborate<'input>(t: &raw::Term<'input>) -> Result<(Term, Term), Error> {
     Ok((t, vty.quote(&ctx.meta_ctx, ctx.lvl())))
 }
 
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::lexer::Lexer;
@@ -663,7 +666,7 @@ mod tests {
         assert_eq!(
             elaborate(&parse(Lexer::new(r"\x -> x"))?)?,
             (
-                Term::Abs(Explicit, Box::new(Term::LocalVar(Ix(0)))),
+                Term::Abs(Explicit, Box::new(Term::LocalVar(Idx(0)))),
                 Term::Pi(
                     Explicit,
                     Box::new(Term::Meta(MetaVar(0))),

@@ -328,16 +328,9 @@ impl PartialRenaming {
 
 impl fmt::Display for PartialRenaming {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
-        write!(fmt, "[")?;
-        let mut first = true;
-        self.map.iter().try_for_each(|(Lvl(x), Lvl(y))| {
-            if !first {
-                write!(fmt, ", ")?;
-            }
-            first = false;
-            write!(fmt, "{} ↦ {}", x, y)
-        })?;
-        write!(fmt, "]")
+        fmt.debug_set()
+            .entries(self.map.iter().map(|(Lvl(x), Lvl(y))| (x, y)))
+            .finish()
     }
 }
 

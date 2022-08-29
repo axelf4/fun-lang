@@ -1,26 +1,48 @@
+use std::collections::HashMap;
+
 /// Raw syntax.
 use crate::core::Icitness::{self, *};
 
+#[salsa::interned]
+pub struct Id {
+    #[return_ref]
+    text: String,
+}
+
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub enum Term<'input> {
+pub enum Term {
     /// The universe.
     Type,
     Number(i32),
-    // TODO Rename to Id
-    Var(&'input str),
-    App(Box<Term<'input>>, Icitness, Box<Term<'input>>),
-    Abs(Icitness, &'input str, Box<Term<'input>>),
-    Pi(&'input str, Box<Term<'input>>, Box<Term<'input>>),
+    Var(Id),
+    App(Box<Term>, Icitness, Box<Term>),
+    Abs(Icitness, Id, Box<Term>),
+    Pi(Id, Box<Term>, Box<Term>),
     /// `_`.
     #[allow(unused)]
     Hole,
 }
 
-pub fn prepend_arg<'input>(f: Term<'input>, e: Term<'input>) -> Term<'input> {
+pub fn prepend_arg(f: Term, e: Term) -> Term {
     match f {
         Term::App(f, Explicit, e2) => {
             Term::App(Box::new(Term::App(f, Explicit, Box::new(e))), Explicit, e2)
         }
         _ => Term::App(Box::new(f), Explicit, Box::new(e)),
     }
+}
+
+#[derive(PartialEq, Eq, Debug)]
+pub enum Definition {
+    Constant {
+        name: Id,
+        ty: Option<Term>,
+        value: Term,
+    },
+}
+
+#[salsa::tracked]
+pub struct Program {
+    #[return_ref]
+    pub defs: HashMap<Id, Definition>,
 }

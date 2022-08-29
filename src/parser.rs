@@ -16,9 +16,9 @@ Parsing proceeds in two phases:
 Implicit arguments cannot be given to operators without using the long
 form (e.g. _+_ {Type} 1 2).
 */
-use crate::ast::{prepend_arg, Term};
+use crate::ast::{prepend_arg, Definition, Id, Program, Term};
 use crate::core::Icitness::{self, *};
-use crate::lexer::{self, Spanned, Token};
+use crate::lexer::{self, Lexer, Spanned, Token};
 use itertools::{intersperse, Itertools as _};
 use lalrpop_util::lalrpop_mod;
 use petgraph::{
@@ -28,7 +28,6 @@ use petgraph::{
 use self_cell::self_cell;
 use std::cell::{RefCell, RefMut};
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::{error, fmt, iter};
 
 use glr::{lalr, Sppf, SppfNode, Symbol};
@@ -39,7 +38,7 @@ lalrpop_mod!(#[allow(clippy::all)] pub fun);
 pub enum Error<'input> {
     LalrpopError(lalrpop_util::ParseError<usize, Token<'input>, lexer::Error<'input>>),
     AmbiguousMixfix,
-    MixfixError,
+    BadMixfix,
     EmptyNamePart(&'input str),
 }
 
@@ -57,7 +56,7 @@ impl<'input> fmt::Display for Error<'input> {
         match self {
             LalrpopError(e) => e.fmt(fmt),
             AmbiguousMixfix => write!(fmt, "term is ambiguous due to mixfix operators"),
-            MixfixError => write!(
+            BadMixfix => write!(
                 fmt,
                 "failed to parse mixfix operator wrt. associativity/precedence"
             ),
@@ -119,7 +118,6 @@ struct Precedence<'input> {
 
 struct PrecedenceGraph<'input> {
     g: Graph<Precedence<'input>, ()>,
-    op_names: HashSet<&'input str>,
     /// Lazily computed mixfix parser.
     parser: RefCell<Option<MixfixParser<'input>>>,
 }
@@ -144,16 +142,10 @@ impl<'a, N, E> Iterator for Roots<'a, N, E> {
     }
 }
 
-impl<'input> PrecedenceGraph<'input> {
-    fn new(g: Graph<Precedence<'input>, ()>) -> Self {
-        let op_names = g
-            .node_weights()
-            .flat_map(|p| &p.operators)
-            .map(|op| op.1)
-            .collect();
+impl<'w> PrecedenceGraph<'w> {
+    fn new(g: Graph<Precedence<'w>, ()>) -> Self {
         Self {
             g,
-            op_names,
             parser: RefCell::new(None),
         }
     }
@@ -162,7 +154,7 @@ impl<'input> PrecedenceGraph<'input> {
         Roots(&self.g, self.g.node_indices())
     }
 
-    fn parser(&self) -> RefMut<'_, MixfixParser<'input>> {
+    fn parser(&self) -> RefMut<'_, MixfixParser<'w>> {
         RefMut::map(self.parser.borrow_mut(), |x| {
             x.get_or_insert_with(|| MixfixParser::from_prec_graph(self))
         })
@@ -170,9 +162,9 @@ impl<'input> PrecedenceGraph<'input> {
 
     fn with_op<R>(
         &mut self,
-        name: &'input str,
+        name: &'w str,
         f: impl FnOnce(&mut Self) -> R,
-    ) -> Result<R, Error<'input>> {
+    ) -> Result<R, Error<'w>> {
         let op = if let Some(op) = Operator::from_str(Associativity::Non, name)? {
             op
         } else {
@@ -181,18 +173,33 @@ impl<'input> PrecedenceGraph<'input> {
         let lvl = self.g.add_node(Precedence {
             operators: vec![op],
         });
-        let new_name = self.op_names.insert(name);
         let old_parser = self.parser.replace(None);
 
         let result = f(self);
 
         *self.parser.borrow_mut() = old_parser;
-        if new_name {
-            self.op_names.remove(name);
-        }
         self.g.remove_node(lvl);
 
         Ok(result)
+    }
+}
+
+impl Default for PrecedenceGraph<'_> {
+    fn default() -> Self {
+        use Associativity::*;
+
+        let mut g = Graph::new();
+        let lvl0 = g.add_node(Precedence {
+            operators: vec![Operator::from_str(Left, "_+_").unwrap().unwrap()],
+        });
+        let lvl1 = g.add_node(Precedence {
+            operators: vec![
+                Operator::from_str(Left, "_*_").unwrap().unwrap(),
+                Operator::from_str(Non, "[_]_").unwrap().unwrap(),
+            ],
+        });
+        g.add_edge(lvl0, lvl1, ());
+        Self::new(g)
     }
 }
 
@@ -345,12 +352,13 @@ impl<'input> MixfixBuilder<'input> {
 
     fn rebuild_inner<'a>(
         &self,
+        db: &dyn crate::Db,
         pg: &'a PrecedenceGraph<'input>,
         sppf: &Sppf,
         nodes: &[SppfNode],
-        input: &mut impl Iterator<Item = (Icitness, Term<'input>)>,
+        input: &mut impl Iterator<Item = (Icitness, Term)>,
         fix: Fixity,
-    ) -> Result<Term<'input>, Error<'input>> {
+    ) -> Result<Term, Error<'input>> {
         let s = (if let Infix(_) | Postfix = fix {
             Some("")
         } else {
@@ -369,13 +377,13 @@ impl<'input> MixfixBuilder<'input> {
             None
         })
         .join("_");
-        let f = Term::Var(pg.op_names.get(s.as_str()).unwrap());
+        let f = Term::Var(Id::new(db, s));
         let e = nodes.iter().skip(1).step_by(2).try_fold(f, |e, &n| {
             input.next().unwrap();
             Ok::<_, Error<'input>>(Term::App(
                 Box::new(e),
                 Explicit,
-                Box::new(self.rebuild(pg, sppf, n, input)?.1),
+                Box::new(self.rebuild(db, pg, sppf, n, input)?.1),
             ))
         })?;
         input.next().unwrap();
@@ -384,11 +392,12 @@ impl<'input> MixfixBuilder<'input> {
 
     fn rebuild<'a>(
         &self,
+        db: &dyn crate::Db,
         pg: &'a PrecedenceGraph<'input>,
         sppf: &Sppf,
         node: SppfNode,
-        input: &mut impl Iterator<Item = (Icitness, Term<'input>)>,
-    ) -> Result<(Icitness, Term<'input>), Error<'input>> {
+        input: &mut impl Iterator<Item = (Icitness, Term)>,
+    ) -> Result<(Icitness, Term), Error<'input>> {
         let is_op_part = |n: SppfNode| {
             if let Ok(s) = n.symbol(sppf) {
                 // If s is a terminal and not non_op
@@ -412,13 +421,13 @@ impl<'input> MixfixBuilder<'input> {
         };
         // TODO Make it an error to supply an implicit arg to an op
         match node.symbol(sppf) {
-            Ok(SYM_ROOT) => self.rebuild(pg, sppf, children[0], input),
+            Ok(SYM_ROOT) => self.rebuild(db, pg, sppf, children[0], input),
             Ok(SYM_JUXTAPOS) => {
-                let e = self.rebuild(pg, sppf, children[0], input)?.1;
+                let e = self.rebuild(db, pg, sppf, children[0], input)?.1;
                 Ok((
                     Explicit,
                     if let Some(&n) = children.get(1) {
-                        let (i, e2) = self.rebuild(pg, sppf, n, input)?;
+                        let (i, e2) = self.rebuild(db, pg, sppf, n, input)?;
                         Term::App(Box::new(e), i, Box::new(e2))
                     } else {
                         e
@@ -428,9 +437,9 @@ impl<'input> MixfixBuilder<'input> {
             Ok(SYM_ATOM) => {
                 // If closed
                 if children.len() == 1 {
-                    self.rebuild(pg, sppf, children[0], input)
+                    self.rebuild(db, pg, sppf, children[0], input)
                 } else {
-                    self.rebuild_inner(pg, sppf, children, input, Closed)
+                    self.rebuild_inner(db, pg, sppf, children, input, Closed)
                         .map(|e| (Explicit, e))
                 }
             }
@@ -439,7 +448,7 @@ impl<'input> MixfixBuilder<'input> {
             // Otherwise, a precedence level
             Ok(_) => match children {
                 [] => unreachable!(),
-                [x] => self.rebuild(pg, sppf, *x, input),
+                [x] => self.rebuild(db, pg, sppf, *x, input),
                 [fst, mid @ .., lst] => {
                     let fix = match (is_op_part(*fst), is_op_part(*lst)) {
                         (false, false) => Infix(Associativity::Non),
@@ -452,24 +461,26 @@ impl<'input> MixfixBuilder<'input> {
                         match fix {
                             Prefix => {
                                 let f = self.rebuild_inner(
+                                    db,
                                     pg,
                                     sppf,
                                     &children[..children.len() - 1],
                                     input,
                                     fix,
                                 )?;
-                                let b = self.rebuild(pg, sppf, *lst, input)?.1;
+                                let b = self.rebuild(db, pg, sppf, *lst, input)?.1;
                                 Term::App(Box::new(f), Explicit, Box::new(b))
                             }
                             Infix(_) => {
-                                let a = self.rebuild(pg, sppf, *fst, input)?.1;
-                                let f = self.rebuild_inner(pg, sppf, mid, input, fix)?;
-                                let b = self.rebuild(pg, sppf, *lst, input)?.1;
+                                let a = self.rebuild(db, pg, sppf, *fst, input)?.1;
+                                let f = self.rebuild_inner(db, pg, sppf, mid, input, fix)?;
+                                let b = self.rebuild(db, pg, sppf, *lst, input)?.1;
                                 Term::App(Box::new(prepend_arg(f, a)), Explicit, Box::new(b))
                             }
                             Postfix => {
-                                let a = self.rebuild(pg, sppf, *fst, input)?.1;
-                                let f = self.rebuild_inner(pg, sppf, &children[1..], input, fix)?;
+                                let a = self.rebuild(db, pg, sppf, *fst, input)?.1;
+                                let f =
+                                    self.rebuild_inner(db, pg, sppf, &children[1..], input, fix)?;
                                 prepend_arg(f, a)
                             }
                             Closed => unreachable!(),
@@ -510,9 +521,10 @@ impl<'input> MixfixParser<'input> {
 
     fn parse(
         &self,
+        db: &dyn crate::Db,
         pg: &PrecedenceGraph<'input>,
-        mut input: impl Iterator<Item = (Icitness, Term<'input>)> + Clone,
-    ) -> Result<Term<'input>, Error<'input>> {
+        mut input: impl Iterator<Item = (Icitness, Term)> + Clone,
+    ) -> Result<Term, Error<'input>> {
         let builder = self.borrow_owner().borrow_owner();
         let grammar = builder.as_grammar();
         let table = self.borrow_dependent();
@@ -521,7 +533,7 @@ impl<'input> MixfixParser<'input> {
         // TODO Do not clone the expressions of the iterator
         let input_symbols = input.clone().map(|e| match e {
             (_, Term::Var(s)) => {
-                if let Some(&sym) = builder.str_to_sym.get(s) {
+                if let Some(&sym) = builder.str_to_sym.get(s.text(db).as_str()) {
                     sym
                 } else {
                     builder.non_op_sym()
@@ -529,16 +541,17 @@ impl<'input> MixfixParser<'input> {
             }
             _ => builder.non_op_sym(),
         });
-        let (sppf, root) = parser.parse(input_symbols).ok_or(Error::MixfixError)?;
+        let (sppf, root) = parser.parse(input_symbols).ok_or(Error::BadMixfix)?;
         // Rebuild the tree
-        Ok(builder.rebuild(pg, &sppf, root, &mut input)?.1)
+        Ok(builder.rebuild(db, pg, &sppf, root, &mut input)?.1)
     }
 }
 
 fn prec_pass<'input, 'a>(
+    db: &'input dyn crate::Db,
     pg: &'a mut PrecedenceGraph<'input>,
-    e: Term<'input>,
-) -> Result<Term<'input>, Error<'input>> {
+    e: Term,
+) -> Result<Term, Error<'input>> {
     Ok(match e {
         Term::Number(_) | Term::Var(_) | Term::Type | Term::Hole => e,
         Term::App(_, _, _) => {
@@ -556,45 +569,56 @@ fn prec_pass<'input, 'a>(
                     }
                 })
             })
-            .map(|(i, e)| prec_pass(pg, e).map(|e| (i, e)))
+            .map(|(i, e)| prec_pass(db, pg, e).map(|e| (i, e)))
             .collect::<Result<_, _>>()?;
 
-            pg.parser().parse(pg, xs.into_iter().rev())?
+            pg.parser().parse(db, pg, xs.into_iter().rev())?
         }
         Term::Abs(i, x, t) => {
-            let t = pg.with_op(x, |g| prec_pass(g, *t))??;
+            let t = pg.with_op(x.text(db), |g| prec_pass(db, g, *t))??;
             Term::Abs(i, x, Box::new(t))
         }
 
         Term::Pi(x, a, b) => {
-            let a = prec_pass(pg, *a)?;
-            let b = pg.with_op(x, |g| prec_pass(g, *b))??;
+            let a = prec_pass(db, pg, *a)?;
+            let b = pg.with_op(x.text(db), |g| prec_pass(db, g, *b))??;
             Term::Pi(x, Box::new(a), Box::new(b))
         }
     })
 }
 
-pub fn parse<'input, I>(input: I) -> Result<Term<'input>, Error<'input>>
+pub fn parse_term<'input, I>(db: &'input dyn crate::Db, input: I) -> Result<Term, Error<'input>>
 where
     I: Iterator<Item = Spanned<Token<'input>, usize, lexer::Error<'input>>>,
 {
-    use Associativity::*;
+    let mut prec_graph = Default::default();
+    let expr = *fun::TermParser::new().parse(db, input)?;
+    prec_pass(db, &mut prec_graph, expr)
+}
 
-    let mut g = Graph::new();
-    let lvl0 = g.add_node(Precedence {
-        operators: vec![Operator::from_str(Left, "_+_").unwrap().unwrap()],
-    });
-    let lvl1 = g.add_node(Precedence {
-        operators: vec![
-            Operator::from_str(Left, "_*_").unwrap().unwrap(),
-            Operator::from_str(Non, "[_]_").unwrap().unwrap(),
-        ],
-    });
-    g.add_edge(lvl0, lvl1, ());
-    let mut prec_graph = PrecedenceGraph::new(g);
+#[salsa::input]
+pub struct ProgramSource {
+    #[return_ref]
+    text: String,
+}
 
-    let expr = *fun::TermParser::new().parse(input)?;
-    prec_pass(&mut prec_graph, expr)
+pub fn parse_program<'w>(db: &'w dyn crate::Db, s: ProgramSource) -> Result<Program, Error<'w>> {
+    let input = Lexer::new(s.text(db));
+    let defs = fun::ProgramParser::new().parse(db, input)?;
+    let mut prec_graph = Default::default();
+    let defs = defs
+        .into_iter()
+        .map(|def| match def {
+            Definition::Constant { name, ty, value } => {
+                let ty = ty
+                    .map(|term| prec_pass(db, &mut prec_graph, term))
+                    .transpose()?;
+                let value = prec_pass(db, &mut prec_graph, value)?;
+                Ok((name, Definition::Constant { name, ty, value }))
+            }
+        })
+        .collect::<Result<_, Error>>()?;
+    Ok(Program::new(db, defs))
 }
 
 #[cfg(test)]
@@ -604,21 +628,34 @@ mod tests {
     use Term::*;
 
     #[test]
-    fn test_parse_mixfix() -> Result<(), Box<dyn error::Error>> {
+    fn test_parse_mixfix() {
+        let db = crate::db::Database::default();
         assert_eq!(
-            parse(Lexer::new(r"1 + [ x ] (2 * 3) + 4 * 5"))?,
+            parse_term(&db, Lexer::new(r"1 + [ x ] (2 * 3) + 4 * 5")).unwrap(),
             App(
                 Box::new(App(
-                    Box::new(Var("_+_")),
+                    Box::new(Var(Id::new(&db, "_+_".into()))),
                     Explicit,
                     Box::new(App(
-                        Box::new(App(Box::new(Var("_+_")), Explicit, Box::new(Number(1)))),
+                        Box::new(App(
+                            Box::new(Var(Id::new(&db, "_+_".into()))),
+                            Explicit,
+                            Box::new(Number(1))
+                        )),
                         Explicit,
                         Box::new(App(
-                            Box::new(App(Box::new(Var("[_]_")), Explicit, Box::new(Var("x")))),
+                            Box::new(App(
+                                Box::new(Var(Id::new(&db, "[_]_".into()))),
+                                Explicit,
+                                Box::new(Var(Id::new(&db, "x".into())))
+                            )),
                             Explicit,
                             Box::new(App(
-                                Box::new(App(Box::new(Var("_*_")), Explicit, Box::new(Number(2)))),
+                                Box::new(App(
+                                    Box::new(Var(Id::new(&db, "_*_".into()))),
+                                    Explicit,
+                                    Box::new(Number(2))
+                                )),
                                 Explicit,
                                 Box::new(Number(3))
                             ))
@@ -627,63 +664,81 @@ mod tests {
                 )),
                 Explicit,
                 Box::new(App(
-                    Box::new(App(Box::new(Var("_*_")), Explicit, Box::new(Number(4)))),
+                    Box::new(App(
+                        Box::new(Var(Id::new(&db, "_*_".into()))),
+                        Explicit,
+                        Box::new(Number(4))
+                    )),
                     Explicit,
                     Box::new(Number(5))
                 ))
             )
         );
-        Ok(())
     }
 
     #[test]
-    fn test_parse_omega() -> Result<(), Box<dyn error::Error>> {
+    fn test_parse_omega() {
+        let db = crate::db::Database::default();
         assert_eq!(
-            parse(Lexer::new(r"\x -> x x"))?,
+            parse_term(&db, Lexer::new(r"\x -> x x")).unwrap(),
             Abs(
                 Explicit,
-                "x",
-                Box::new(App(Box::new(Var("x")), Explicit, Box::new(Var("x"))))
+                Id::new(&db, "x".into()),
+                Box::new(App(
+                    Box::new(Var(Id::new(&db, "x".into()))),
+                    Explicit,
+                    Box::new(Var(Id::new(&db, "x".into())))
+                ))
             )
         );
-        Ok(())
     }
 
     #[test]
-    fn test_parse_empty_layout() -> Result<(), Box<dyn error::Error>> {
-        let expr = parse(Lexer::new("case 0 of"))?;
+    fn test_parse_empty_layout() {
+        let db = crate::db::Database::default();
+        let expr = parse_term(&db, Lexer::new("case 0 of")).unwrap();
         assert_eq!(expr, Number(69));
-
-        Ok(())
     }
 
     #[test]
-    fn test_parse_bound_mixfix() -> Result<(), Box<dyn error::Error>> {
+    fn test_parse_bound_mixfix() {
+        let db = crate::db::Database::default();
         assert_eq!(
-            parse(Lexer::new(r"\_⁻¹ -> x ⁻¹"))?,
+            parse_term(&db, Lexer::new(r"\_⁻¹ -> x ⁻¹")).unwrap(),
             Abs(
                 Explicit,
-                "_⁻¹",
-                Box::new(App(Box::new(Var("_⁻¹")), Explicit, Box::new(Var("x"))))
+                Id::new(&db, "_⁻¹".into()),
+                Box::new(App(
+                    Box::new(Var(Id::new(&db, "_⁻¹".into()))),
+                    Explicit,
+                    Box::new(Var(Id::new(&db, "x".into())))
+                ))
             )
         );
-        Ok(())
     }
 
     #[test]
-    fn test_parse_implicit_arg() -> Result<(), Box<dyn error::Error>> {
+    fn test_parse_implicit_arg() {
+        let db = crate::db::Database::default();
         assert_eq!(
-            parse(Lexer::new(r"0 + id {Type} Type"))?,
+            parse_term(&db, Lexer::new(r"0 + id {Type} Type")).unwrap(),
             App(
-                Box::new(App(Box::new(Var("_+_")), Explicit, Box::new(Number(0)))),
+                Box::new(App(
+                    Box::new(Var(Id::new(&db, "_+_".into()))),
+                    Explicit,
+                    Box::new(Number(0))
+                )),
                 Explicit,
                 Box::new(App(
-                    Box::new(App(Box::new(Var("id")), Implicit, Box::new(Type))),
+                    Box::new(App(
+                        Box::new(Var(Id::new(&db, "id".into()))),
+                        Implicit,
+                        Box::new(Type)
+                    )),
                     Explicit,
                     Box::new(Type)
                 ))
             )
         );
-        Ok(())
     }
 }

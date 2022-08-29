@@ -5,6 +5,7 @@ use std::fmt;
 use std::ops;
 
 use crate::ast as raw;
+use crate::ast::Id;
 use crate::core::{
     Icitness::{self, *},
     Idx, MetaVar, Term, Type,
@@ -259,7 +260,6 @@ impl error::Error for Error {}
 
 #[derive(Clone, Debug)]
 enum SymbolValue {
-    // Top,
     Local(Lvl, Vtype),
 }
 
@@ -335,22 +335,21 @@ impl fmt::Display for PartialRenaming {
     }
 }
 
-#[derive(Debug)]
-struct Ctx<'input> {
+struct Ctx<'w> {
+    db: &'w dyn crate::Db,
     meta_ctx: MetaCtx,
-
     /// Local evaluation environment.
     env: Env,
     /// Mask of what entries in the local context metas abstract over.
     bds: Vec<bool>,
-
     /// Symbol table.
-    table: HashMap<&'input str, SymbolValue>,
+    table: HashMap<Id, SymbolValue>,
 }
 
-impl<'input> Ctx<'input> {
-    fn new() -> Self {
+impl<'w> Ctx<'w> {
+    fn new(db: &'w dyn crate::Db) -> Self {
         Self {
+            db,
             meta_ctx: MetaCtx::new(),
             env: Env::new(),
             bds: Vec::new(),
@@ -508,18 +507,24 @@ impl<'input> Ctx<'input> {
 
     /// Run the function in this context extended with a bound
     /// variable/definition (TODO).
-    fn with<R>(&mut self, x: &'input str, a: Vtype, f: impl FnOnce(&mut Ctx<'input>) -> R) -> R {
+    fn with<R>(&mut self, x: Option<(Id, Vtype)>, f: impl FnOnce(&mut Ctx) -> R) -> R {
         let l = self.lvl();
         self.env.0.push(Value::Rigid(l, Spine::new()));
         self.bds.push(true);
-        let old_sym = self.table.insert(x, SymbolValue::Local(l, a));
+        let (id, old_sym) = if let Some((id, a)) = x {
+            (Some(id), self.table.insert(id, SymbolValue::Local(l, a)))
+        } else {
+            (None, None)
+        };
 
         let result = f(self);
 
-        if let Some(sym) = old_sym {
-            self.table.insert(x, sym);
-        } else {
-            self.table.remove(x);
+        if let Some(id) = id {
+            if let Some(sym) = old_sym {
+                self.table.insert(id, sym);
+            } else {
+                self.table.remove(&id);
+            }
         }
         self.bds.pop();
         self.env.0.pop();
@@ -545,13 +550,13 @@ impl<'input> Ctx<'input> {
         }
     }
 
-    fn infer(&mut self, term: &raw::Term<'input>) -> Result<(Term, Vtype), Error> {
+    fn infer(&mut self, term: &raw::Term) -> Result<(Term, Vtype), Error> {
         Ok(match term {
             raw::Term::Var(x) => {
                 match self
                     .table
                     .get(x)
-                    .ok_or_else(|| Error::NotInScope(x.to_string()))?
+                    .ok_or_else(|| Error::NotInScope(x.text(self.db).to_owned()))?
                 {
                     SymbolValue::Local(x, a) => (Term::LocalVar(x.to_idx(self.lvl())), a.clone()),
                 }
@@ -560,7 +565,7 @@ impl<'input> Ctx<'input> {
             raw::Term::Abs(i, x, t) => {
                 let i = *i;
                 let a = self.fresh_meta().eval(&self.meta_ctx, &self.env);
-                let (t, b) = match self.with(x, a.clone(), |ctx| ctx.infer(t.as_ref()))? {
+                let (t, b) = match self.with(Some((*x, a.clone())), |ctx| ctx.infer(t.as_ref()))? {
                     x @ (Type::Abs(Implicit, _), _) => x,
                     // Insert fresh implicit applications to a term
                     // which is not an implicit lambda (i.e. neutral).
@@ -584,9 +589,10 @@ impl<'input> Ctx<'input> {
                     Value::Pi(_i2, a, b) => (*a, b),
                     tty => {
                         let a = self.fresh_meta().eval(&self.meta_ctx, &self.env);
+                        let x = Id::new(self.db, "__x".into());
                         let b = Closure(
                             self.env.clone(),
-                            self.with("x", a.clone(), |ctx| ctx.fresh_meta()),
+                            self.with(Some((x, a.clone())), |ctx| ctx.fresh_meta()),
                         );
                         self.unify(
                             self.lvl(),
@@ -605,7 +611,7 @@ impl<'input> Ctx<'input> {
 
             raw::Term::Pi(x, a, b) => {
                 let a = self.check(a.as_ref(), Value::Type)?;
-                let b = self.with(x, a.eval(&self.meta_ctx, &self.env), |ctx| {
+                let b = self.with(Some((*x, a.eval(&self.meta_ctx, &self.env))), |ctx| {
                     ctx.check(b.as_ref(), Value::Type)
                 })?;
                 (Term::Pi(Explicit, Box::new(a), Box::new(b)), Value::Type)
@@ -621,13 +627,13 @@ impl<'input> Ctx<'input> {
         })
     }
 
-    fn check(&mut self, t: &raw::Term<'input>, a: Vtype) -> Result<Term, Error> {
+    fn check(&mut self, t: &raw::Term, a: Vtype) -> Result<Term, Error> {
         Ok(match (t, a.force(&self.meta_ctx)) {
             (raw::Term::Abs(i2, x, t), Value::Pi(i, a, b)) if i == *i2 => {
                 let l = self.lvl();
                 Term::Abs(
                     i,
-                    Box::new(self.with(x, *a, |ctx| {
+                    Box::new(self.with(Some((*x, *a)), |ctx| {
                         let x = ctx.check(
                             t.as_ref(),
                             b.apply(&ctx.meta_ctx, Value::Rigid(l, Spine::new())),
@@ -648,8 +654,8 @@ impl<'input> Ctx<'input> {
     }
 }
 
-pub fn elaborate<'input>(t: &raw::Term<'input>) -> Result<(Term, Term), Error> {
-    let mut ctx = Ctx::new();
+pub fn elaborate(db: &dyn crate::Db, t: &raw::Term) -> Result<(Term, Type), Error> {
+    let mut ctx = Ctx::new(db);
     let (mut t, vty) = ctx.infer(t)?;
     t.zonk(&ctx.meta_ctx, &mut Env::new(), Lvl(0))?;
     Ok((t, vty.quote(&ctx.meta_ctx, ctx.lvl())))
@@ -659,12 +665,13 @@ pub fn elaborate<'input>(t: &raw::Term<'input>) -> Result<(Term, Term), Error> {
 mod tests {
     use super::*;
     use crate::lexer::Lexer;
-    use crate::parser::parse;
+    use crate::parser::parse_term;
 
     #[test]
     fn test_elaborate_id() -> Result<(), Box<dyn error::Error>> {
+        let db = crate::db::Database::default();
         assert_eq!(
-            elaborate(&parse(Lexer::new(r"\x -> x"))?)?,
+            elaborate(&db, &parse_term(&db, Lexer::new(r"\x -> x")).unwrap())?,
             (
                 Term::Abs(Explicit, Box::new(Term::LocalVar(Idx(0)))),
                 Term::Pi(
@@ -679,8 +686,12 @@ mod tests {
 
     #[test]
     fn test_elaborate_simple_pi() -> Result<(), Box<dyn error::Error>> {
+        let db = crate::db::Database::default();
         assert_eq!(
-            elaborate(&parse(Lexer::new("(x : Type) -> Type"))?)?,
+            elaborate(
+                &db,
+                &parse_term(&db, Lexer::new("(x : Type) -> Type")).unwrap()
+            )?,
             (
                 Term::Pi(Explicit, Box::new(Term::Type), Box::new(Term::Type)),
                 Term::Type
@@ -692,16 +703,9 @@ mod tests {
     /// Try to compute the type of "λ x → x x".
     #[test]
     fn test_occurs_check() {
+        let db = crate::db::Database::default();
         assert_eq!(
-            elaborate(&raw::Term::Abs(
-                Explicit,
-                "x",
-                Box::new(raw::Term::App(
-                    Box::new(raw::Term::Var("x")),
-                    Explicit,
-                    Box::new(raw::Term::Var("x"))
-                ))
-            )),
+            elaborate(&db, &parse_term(&db, Lexer::new(r"\x -> x x")).unwrap()),
             Err(Error::UnificationFailure)
         );
     }

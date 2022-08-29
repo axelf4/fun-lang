@@ -6,14 +6,15 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [build-dependencies]
-lalrpop = "0.19.7"
+lalrpop = "0.19.8"
 
 [dependencies]
 logos = "0.12.0"
-lalrpop-util = { version = "0.19.7" }
+lalrpop-util = { version = "0.19.8" }
 regex = "1"
 petgraph = "0.6.0"
 glr = "0.1.0"
+salsa = { git = "https://github.com/salsa-rs/salsa", package = "salsa-2022" }
 itertools = "0.10.3"
 self_cell = "0.10.2"
 take_mut = "0.2.2"

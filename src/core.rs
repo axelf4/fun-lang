@@ -24,7 +24,7 @@ pub enum Term {
     Pi(Icitness, Box<Type>, Box<Type>),
 
     Meta(MetaVar),
-    /// Representation of a hole plugged with a meta.
+    /// Representation of a hole plugged with a meta variable.
     InsertedMeta(MetaVar, Vec<bool>),
 }
 

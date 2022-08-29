@@ -1,7 +1,7 @@
-grammar<'input>;
+grammar<'input>(db: &dyn crate::Db);
 
 use crate::lexer::{self, Token};
-use crate::ast::{Term};
+use crate::ast::{Id, Term, Definition};
 use crate::core::Icitness::*;
 
 extern {
@@ -40,16 +40,20 @@ Comma<T>: Vec<T> = {
     }
 };
 
-Binding: (&'input str, Option<Box<Term<'input>>>, Box<Term<'input>>) = {
-	<x:Ident> "=" <e:Term> => (x, None, e),
-	<x:Ident> ":" <t:Term> "=" <e:Term> => (x, Some(t), e),
+Id: Id = {
+	Ident => Id::new(db, <>.to_string()),
 }
 
-pub Term: Box<Term<'input>> = {
-	Term1,
-	"\\" <x:Ident> "->" <e:Term1> => Box::new(Term::Abs(Explicit, x, e)),
+Binding: (Id, Option<Box<Term>>, Box<Term>) = {
+	<x:Id> "=" <e:Term> => (x, None, e),
+	<x:Id> ":" <t:Term> "=" <e:Term> => (x, Some(t), e),
+}
 
-	"(" <x:Ident> ":" <a:Term> ")" "->" <b:Term> => Box::new(Term::Pi(<>)),
+pub Term: Box<Term> = {
+	Term1,
+	"\\" <x:Id> "->" <e:Term1> => Box::new(Term::Abs(Explicit, x, e)),
+
+	"(" <x:Id> ":" <a:Term> ")" "->" <b:Term> => Box::new(Term::Pi(<>)),
 
 	"case" <_x:Term> "of" "@{" Comma<Arm> "}@" => Box::new(Term::Number(69)),
 
@@ -58,15 +62,15 @@ pub Term: Box<Term<'input>> = {
 	},
 };
 
-Term1: Box<Term<'input>> = {
+Term1: Box<Term> = {
 	Term2,
 	<a:Term1> <b:Term2> => Box::new(Term::App(a, Explicit, b)),
 	<a:Term1> "{" <b:Term> "}" => Box::new(Term::App(a, Implicit, b)),
 }
 
-Term2: Box<Term<'input>> = {
+Term2: Box<Term> = {
 	Num => Box::new(Term::Number(<>)),
-	Ident => Box::new(Term::Var(<>)),
+	Id => Box::new(Term::Var(<>)),
 	"Type" => Box::new(Term::Type),
 	"(" <Term> ")",
 };
@@ -74,3 +78,9 @@ Term2: Box<Term<'input>> = {
 Arm: () = {
 	Term "->" Term => {},
 };
+
+Definition: Definition = {
+	<Binding> => Definition::Constant { name: <>.0, ty: <>.1.map(|x| *x), value: *<>.2 },
+};
+
+pub Program = Comma<Definition>;

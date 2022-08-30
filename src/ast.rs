@@ -11,13 +11,12 @@ pub struct Id {
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Term {
-    /// The universe.
     Type,
     Number(i32),
     Var(Id),
     App(Box<Term>, Icitness, Box<Term>),
     Abs(Icitness, Id, Box<Term>),
-    Pi(Id, Box<Term>, Box<Term>),
+    Pi(Icitness, Option<Id>, Box<Term>, Box<Term>),
     /// `_`.
     #[allow(unused)]
     Hole,
@@ -32,7 +31,7 @@ pub fn prepend_arg(f: Term, e: Term) -> Term {
     }
 }
 
-#[derive(PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Definition {
     Constant {
         name: Id,

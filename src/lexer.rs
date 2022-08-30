@@ -141,6 +141,11 @@ impl<'input> Lexer<'input> {
         }
     }
 
+    pub fn open_layout(mut self) -> Self {
+        self.stack.push(State::LayoutStart(0));
+        self
+    }
+
     fn collapse(&mut self, mut f: impl FnMut(&State) -> bool) {
         let pos = self.cursor;
         while let Some(state) = self.stack.last() {
@@ -201,7 +206,7 @@ impl<'input> Iterator for Lexer<'input> {
 
         let column = self.column;
         let is_offside = |state: &State| match state {
-            State::LayoutStart(layout_col) if newline && column <= *layout_col => true,
+            State::LayoutStart(layout_col) if newline && column < *layout_col => true,
             State::Layout(layout_col) if newline && column < *layout_col => true,
             _ => false,
         };
@@ -251,13 +256,13 @@ impl<'input> Iterator for Lexer<'input> {
                 if self.stack.last() == Some(&State::Delimiter(Delimiter::CaseOf)) {
                     self.stack.pop();
                 }
-                self.stack.push(State::LayoutStart(self.line_start));
+                self.stack.push(State::LayoutStart(self.line_start + 1));
             }
 
             Token::Let => {
                 self.collapse(is_offside);
                 self.stack.push(State::Delimiter(Delimiter::LetIn));
-                self.stack.push(State::LayoutStart(self.line_start));
+                self.stack.push(State::LayoutStart(self.line_start + 1));
             }
             Token::In => {
                 // Collapse up to and including "let" start marker
@@ -274,7 +279,7 @@ impl<'input> Iterator for Lexer<'input> {
 
         if should_insert_default {
             match self.stack.last() {
-                Some(State::LayoutStart(min_col)) if self.column > *min_col => {
+                Some(State::LayoutStart(min_col)) if self.column >= *min_col => {
                     self.stack.pop();
                     self.stack.push(State::Layout(self.column));
                     self.next.push((start, Token::LayoutStart, start));

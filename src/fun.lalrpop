@@ -51,11 +51,13 @@ Binding: (Id, Option<Box<Term>>, Box<Term>) = {
 
 pub Term: Box<Term> = {
 	Term1,
-	"\\" <x:Id> "->" <e:Term1> => Box::new(Term::Abs(Explicit, x, e)),
+	"\\" <x:Id> "->" <e:Term> => Box::new(Term::Abs(Explicit, <>)),
+	"\\" "{" <x:Id> "}" "->" <e:Term> => Box::new(Term::Abs(Implicit, <>)),
 
-	"(" <x:Id> ":" <a:Term> ")" "->" <b:Term> => Box::new(Term::Pi(<>)),
-
-	"case" <_x:Term> "of" "@{" Comma<Arm> "}@" => Box::new(Term::Number(69)),
+	<a:Term1> "->" <b:Term> => Box::new(Term::Pi(Explicit, None, <>)),
+	"(" <x:Id> ":" <a:Term> ")" "->" <b:Term> => Box::new(Term::Pi(Explicit, Some(x), a, b)),
+	"{" <a:Term> "}" "->" <b:Term> => Box::new(Term::Pi(Implicit, None, <>)),
+	"{" <x:Id> ":" <a:Term> "}" "->" <b:Term> => Box::new(Term::Pi(Implicit, Some(x), a, b)),
 
 	"let" "@{" <bs:Comma<Binding>> "}@" "in" <e:Term> => {
 		bs.into_iter().rev().fold(e, |acc, (x, _t, v)| Box::new(Term::App(Box::new(Term::Abs(Explicit, x, acc)), Explicit, v)))
@@ -69,18 +71,22 @@ Term1: Box<Term> = {
 }
 
 Term2: Box<Term> = {
+	"(" <Term> ")",
 	Num => Box::new(Term::Number(<>)),
 	Id => Box::new(Term::Var(<>)),
 	"Type" => Box::new(Term::Type),
-	"(" <Term> ")",
+
+	"case" <_x:Term> "of" "@{" Comma<Arm> "}@" => Box::new(Term::Number(69)),
 };
 
 Arm: () = {
-	Term "->" Term => {},
+	Term1 "->" Term1 => {},
 };
 
 Definition: Definition = {
 	<Binding> => Definition::Constant { name: <>.0, ty: <>.1.map(|x| *x), value: *<>.2 },
 };
 
-pub Program = Comma<Definition>;
+pub Program = {
+	"@{" <Comma<Definition>> "}@",
+};

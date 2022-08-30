@@ -160,19 +160,28 @@ impl<'w> PrecedenceGraph<'w> {
         })
     }
 
+    fn add_op(&mut self, name: &'w str) -> Result<Option<NodeIndex>, Error<'w>> {
+        let op = if let Some(op) = Operator::from_str(Associativity::Non, name)? {
+            op
+        } else {
+            return Ok(None);
+        };
+        let lvl = self.g.add_node(Precedence {
+            operators: vec![op],
+        });
+        Ok(Some(lvl))
+    }
+
     fn with_op<R>(
         &mut self,
         name: &'w str,
         f: impl FnOnce(&mut Self) -> R,
     ) -> Result<R, Error<'w>> {
-        let op = if let Some(op) = Operator::from_str(Associativity::Non, name)? {
-            op
+        let lvl = if let Some(x) = self.add_op(name)? {
+            x
         } else {
             return Ok(f(self));
         };
-        let lvl = self.g.add_node(Precedence {
-            operators: vec![op],
-        });
         let old_parser = self.parser.replace(None);
 
         let result = f(self);
@@ -273,7 +282,7 @@ impl<'input> MixfixBuilder<'input> {
 
     fn build<'a>(&mut self, pg: &'a PrecedenceGraph<'input>) {
         // Reserve symbols for root/juxtaposition/atom
-        for _ in 0..3 {
+        for _ in SYM_ROOT..=SYM_ATOM {
             self.productions.push(Vec::new());
         }
 
@@ -296,7 +305,8 @@ impl<'input> MixfixBuilder<'input> {
                     .flat_map(|p| &p.operators)
                     .filter(|&op| op.0 == Closed)
                     .map(|op| {
-                        intersperse(op.name_parts().map(|s| self.sym_for_str(s)), 0).collect()
+                        intersperse(op.name_parts().map(|s| self.sym_for_str(s)), SYM_ROOT)
+                            .collect()
                     }),
             )
             .collect();
@@ -327,7 +337,7 @@ impl<'input> MixfixBuilder<'input> {
 
         let mut prods = vec![vec![p_suc]];
         for op in &p.operators {
-            let inner = intersperse(op.name_parts().map(|s| self.sym_for_str(s)), 0);
+            let inner = intersperse(op.name_parts().map(|s| self.sym_for_str(s)), SYM_ROOT);
             prods.push(match op.0 {
                 Closed => continue,
                 Prefix => inner.chain(iter::once(sym)).collect(),
@@ -410,9 +420,8 @@ impl<'input> MixfixBuilder<'input> {
             let mut family = node.family(sppf);
             if let Some(children) = family.next() {
                 if family.next().is_some() {
-                    // TODO This will probably shit itself if the
-                    // graph is not linear.
-                    return Err(Error::AmbiguousMixfix);
+                    // TODO This will shit itself if the graph is not linear.
+                    // TODO return Err(Error::AmbiguousMixfix);
                 }
                 children
             } else {
@@ -579,10 +588,14 @@ fn prec_pass<'input, 'a>(
             Term::Abs(i, x, Box::new(t))
         }
 
-        Term::Pi(x, a, b) => {
+        Term::Pi(i, x, a, b) => {
             let a = prec_pass(db, pg, *a)?;
-            let b = pg.with_op(x.text(db), |g| prec_pass(db, g, *b))??;
-            Term::Pi(x, Box::new(a), Box::new(b))
+            let b = if let Some(x) = x {
+                pg.with_op(x.text(db), |g| prec_pass(db, g, *b))?
+            } else {
+                prec_pass(db, pg, *b)
+            }?;
+            Term::Pi(i, x, Box::new(a), Box::new(b))
         }
     })
 }
@@ -602,10 +615,18 @@ pub struct ProgramSource {
     text: String,
 }
 
-pub fn parse_program<'w>(db: &'w dyn crate::Db, s: ProgramSource) -> Result<Program, Error<'w>> {
-    let input = Lexer::new(s.text(db));
-    let defs = fun::ProgramParser::new().parse(db, input)?;
-    let mut prec_graph = Default::default();
+#[salsa::tracked]
+pub fn parse_program(db: &dyn crate::Db, s: ProgramSource) -> Result<Program, String> {
+    let input = Lexer::new(s.text(db)).open_layout();
+    let defs = fun::ProgramParser::new()
+        .parse(db, input)
+        .map_err(|e| e.to_string())?;
+    let mut prec_graph = PrecedenceGraph::default();
+    for Definition::Constant { name, .. } in &defs {
+        prec_graph
+            .add_op(name.text(db))
+            .map_err(|e| e.to_string())?;
+    }
     let defs = defs
         .into_iter()
         .map(|def| match def {
@@ -617,7 +638,8 @@ pub fn parse_program<'w>(db: &'w dyn crate::Db, s: ProgramSource) -> Result<Prog
                 Ok((name, Definition::Constant { name, ty, value }))
             }
         })
-        .collect::<Result<_, Error>>()?;
+        .collect::<Result<_, Error>>()
+        .map_err(|e| e.to_string())?;
     Ok(Program::new(db, defs))
 }
 
@@ -701,7 +723,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_bound_mixfix() {
+    fn test_parse_bound_postfix() {
         let db = crate::db::Database::default();
         assert_eq!(
             parse_term(&db, Lexer::new(r"\_⁻¹ -> x ⁻¹")).unwrap(),

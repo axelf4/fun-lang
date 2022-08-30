@@ -1,6 +1,8 @@
 //! Core language syntax.
 use std::fmt;
 
+use crate::ast::Id;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Icitness {
     Explicit,
@@ -14,8 +16,10 @@ pub struct Idx(pub usize);
 /// Core term.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Term {
-    /// A local variable.
-    LocalVar(Idx),
+    /// A reference to a local variable.
+    Local(Idx),
+    /// A reference to a global variable.
+    Global(Id),
     App(Box<Term>, Icitness, Box<Term>),
     Abs(Icitness, Box<Term>),
     /// The universe.
@@ -37,4 +41,14 @@ impl fmt::Display for MetaVar {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
         write!(fmt, "?{}", self.0)
     }
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Definition {
+    Constant { name: String, ty: Type, value: Term },
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Program {
+    pub defs: Vec<Definition>,
 }
